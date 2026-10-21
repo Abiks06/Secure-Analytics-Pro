@@ -29,3 +29,10 @@ yarn-error.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# Secure Analytics Pro v2
+Backend/data/
+.pytest_cache/
+.ruff_cache/
+*.tsbuildinfo
+.claude/

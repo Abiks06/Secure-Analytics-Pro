@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-supabase
-python-jose[cryptography]
-pandas
-python-multipart
-python-dotenv

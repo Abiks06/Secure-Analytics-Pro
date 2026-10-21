@@ -1,18 +1,16 @@
 {
   "name": "secure-analytics-pro",
-  "version": "1.0.0",
-  "description": "",
+  "version": "2.0.0",
   "private": true,
+  "description": "Secure Analytics Pro: encrypted, privacy-first automated analytics (FastAPI + Polars + DuckDB + React).",
   "scripts": {
-    "dev:frontend": "npm run dev --prefix Frontend",
-    "dev:backend": "Backend\\venv\\Scripts\\activate && uvicorn Backend.main:app --reload",
-    "dev": "concurrently \"npm run dev:frontend\" \"npm run dev:backend\"",
-    "install:all": "npm install --prefix Frontend && echo 'Backend venv handled manually or via script'"
+    "setup": "npm ci --prefix Frontend && uv --directory Backend sync",
+    "dev": "concurrently -k -n api,web -c magenta,cyan \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "uv --directory Backend run uvicorn app.main:app --reload --port 8000",
+    "dev:web": "npm run dev --prefix Frontend",
+    "test": "uv --directory Backend run pytest -q && npm run build --prefix Frontend",
+    "sample": "uv --directory Backend run python scripts/make_sample.py ../samples/messy_sales.csv --rows 5000"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "devDependencies": {
     "concurrently": "^9.2.1"
   }

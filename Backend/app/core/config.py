@@ -22,7 +22,10 @@ class Settings(BaseSettings):
     # Supabase Postgres via the session pooler, as the least-privilege `sap_engine` role.
     # SQLite is supported for offline tests only.
     database_url: str = "sqlite+aiosqlite:///./data/app.db"
-    data_dir: Path = Path("./data")
+    # Vercel's filesystem is read-only apart from /tmp; nothing durable is stored here anyway.
+    data_dir: Path = Field(
+        default_factory=lambda: Path("/tmp/sap-data") if os.environ.get("VERCEL") else Path("./data")
+    )
 
     # Supabase project. Auth tokens are verified against its public JWKS; encrypted datasets
     # are stored in its private `datasets` bucket using the caller's own access token.
@@ -37,7 +40,8 @@ class Settings(BaseSettings):
 
     cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["http://localhost:5173"])
 
-    max_upload_mb: int = 200
+    # Encrypted uploads go straight to Supabase Storage, whose free plan caps objects at 50 MB.
+    max_upload_mb: int = 45
     max_decompressed_mb: int = 1024
     worker_concurrency: int = 2
     frame_cache_mb: int = 512

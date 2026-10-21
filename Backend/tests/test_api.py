@@ -171,3 +171,29 @@ async def test_delete_crypto_shreds(client):
     assert (await client.delete(f"/api/datasets/{d['id']}", headers=h)).status_code == 204
     assert not path.exists()
     assert (await client.get(f"/api/datasets/{d['id']}", headers=h)).status_code == 404
+
+
+async def test_upload_rejects_wrong_key_and_double_processing(client):
+    import base64
+    import secrets
+
+    from app.core import crypto
+    from app.services import storage
+
+    h = await make_user(client)
+    created = (await client.post("/api/datasets", json={"name": "a.csv", "size_bytes": 8}, headers=h)).json()
+    blob = crypto.encrypt_blob(secrets.token_bytes(32), b"a,b\n1,2\n", created["upload_context"])
+    storage.put_raw(created["upload_path"], blob, "t")
+    wrong = base64.b64encode(secrets.token_bytes(32)).decode()
+    r = await client.post(f"/api/datasets/{created['id']}/process", json={"key": wrong}, headers=h)
+    assert '"status": "failed"' in r.text and "decrypted" in r.text
+    assert not storage._local_file(created["upload_path"]).exists()
+    # A dataset can only be processed once.
+    r = await client.post(f"/api/datasets/{created['id']}/process", json={"key": wrong}, headers=h)
+    assert r.status_code == 409
+
+
+async def test_upload_size_limit(client):
+    h = await make_user(client)
+    r = await client.post("/api/datasets", json={"name": "big.csv", "size_bytes": 10**10}, headers=h)
+    assert r.status_code == 413

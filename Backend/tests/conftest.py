@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import shutil
@@ -81,12 +80,23 @@ async def make_user(client: httpx.AsyncClient) -> dict[str, str]:
 
 
 async def upload_and_wait(client: httpx.AsyncClient, headers: dict, content: bytes, name: str = "data.csv") -> dict:
-    r = await client.post("/api/datasets", files={"file": (name, content, "text/plain")}, headers=headers)
-    assert r.status_code == 202, r.text
-    ds_id = r.json()["id"]
-    for _ in range(300):
-        d = (await client.get(f"/api/datasets/{ds_id}", headers=headers)).json()
-        if d["status"] in ("ready", "failed"):
-            return d
-        await asyncio.sleep(0.05)
-    raise AssertionError("dataset never finished processing")
+    """The browser flow: register, encrypt with a one-time key, upload ciphertext, process."""
+    import base64
+    import secrets
+
+    from app.core import crypto
+    from app.services import storage
+
+    r = await client.post("/api/datasets", json={"name": name, "size_bytes": len(content)}, headers=headers)
+    assert r.status_code == 201, r.text
+    created = r.json()
+    key = secrets.token_bytes(32)
+    storage.put_raw(created["upload_path"], crypto.encrypt_blob(key, content, created["upload_context"]), "test")
+    r = await client.post(
+        f"/api/datasets/{created['id']}/process", json={"key": base64.b64encode(key).decode()}, headers=headers
+    )
+    assert r.status_code == 200, r.text
+    events = [json.loads(line[5:]) for line in r.text.splitlines() if line.startswith("data:")]
+    assert events and events[-1]["status"] in ("ready", "failed"), events
+    assert not storage._local_file(created["upload_path"]).exists(), "encrypted upload must be deleted"
+    return (await client.get(f"/api/datasets/{created['id']}", headers=headers)).json()

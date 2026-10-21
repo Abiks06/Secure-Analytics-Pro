@@ -20,10 +20,10 @@ import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import { PIPELINE } from "../../components/UploadPanel";
-import { Badge, Button, Card, cx, Empty, QualityRing, Skeleton, Tabs } from "../../components/ui";
-import { api, ApiError, streamProgress } from "../../lib/api";
+import { Badge, Button, Card, Empty, QualityRing, Skeleton, Tabs } from "../../components/ui";
+import { api, ApiError } from "../../lib/api";
 import { bytes, ms, qualityTone } from "../../lib/format";
-import type { DatasetSummary, ProgressEvent, Report } from "../../lib/types";
+import type { DatasetSummary, Report } from "../../lib/types";
 import ColumnsTab from "./ColumnsTab";
 import CorrelationsTab from "./CorrelationsTab";
 import DataTab from "./DataTab";
@@ -36,36 +36,21 @@ import TrendsTab from "./TrendsTab";
 type TabId = "overview" | "insights" | "columns" | "correlations" | "trends" | "privacy" | "explore" | "data";
 
 function Processing({ ds }: { ds: DatasetSummary }) {
-  const [event, setEvent] = useState<ProgressEvent | null>(null);
-  const qc = useQueryClient();
-  useEffect(() => {
-    const ctrl = new AbortController();
-    streamProgress(
-      ds.id,
-      (e) => {
-        setEvent(e);
-        if (e.status === "ready" || e.status === "failed") {
-          qc.invalidateQueries({ queryKey: ["dataset", ds.id] });
-          qc.invalidateQueries({ queryKey: ["datasets"] });
-        }
-      },
-      ctrl.signal,
-    ).catch(() => undefined);
-    return () => ctrl.abort();
-  }, [ds.id, qc]);
-  const idx = PIPELINE.findIndex((s) => s.id === (event?.stage ?? ds.stage));
+  // Live progress streams to the tab that uploaded the file; elsewhere we poll the status.
   return (
     <Card className="mx-auto max-w-xl p-8 text-center">
       <div className="mx-auto grid size-14 place-items-center rounded-2xl bg-brand-gradient text-white shadow-xl shadow-brand-600/30">
         <Lock className="size-6 animate-pulse" />
       </div>
       <h2 className="mt-5 text-xl font-semibold">Analysing {ds.name}</h2>
-      <p className="mt-1 text-sm text-fg-muted">{event?.message ?? "Streaming progress from the engine…"}</p>
+      <p className="mt-1 text-sm text-fg-muted">
+        {ds.status === "queued" ? "Waiting for the encrypted upload to finish…" : "Cleaning, profiling and encrypting. This page updates automatically."}
+      </p>
       <div className="mt-7 space-y-2 text-left">
-        {PIPELINE.map((s, i) => (
+        {PIPELINE.map((s) => (
           <div key={s.id} className="flex items-center gap-3 text-sm">
-            <span className={cx("size-2 rounded-full", i < idx ? "bg-mint" : i === idx ? "animate-pulse bg-brand-400" : "bg-white/10")} />
-            <span className={i <= idx ? "text-fg" : "text-fg-subtle"}>{s.label}</span>
+            <span className="size-2 animate-pulse rounded-full bg-brand-400" />
+            <span className="text-fg-muted">{s.label}</span>
           </div>
         ))}
       </div>
@@ -158,7 +143,11 @@ export default function DatasetPage() {
   const tab = (params.get("tab") as TabId) || "overview";
   const setTab = (t: TabId) => setParams(t === "overview" ? {} : { tab: t }, { replace: true });
 
-  const meta = useQuery({ queryKey: ["dataset", id], queryFn: () => api.dataset(id) });
+  const meta = useQuery({
+    queryKey: ["dataset", id],
+    queryFn: () => api.dataset(id),
+    refetchInterval: (q) => (q.state.data?.status === "queued" || q.state.data?.status === "processing" ? 2500 : false),
+  });
   const ready = meta.data?.status === "ready";
   const report = useQuery({ queryKey: ["report", id, meta.data?.updated_at], queryFn: () => api.report(id), enabled: ready, staleTime: Infinity });
 

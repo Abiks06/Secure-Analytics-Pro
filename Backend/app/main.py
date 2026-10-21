@@ -27,7 +27,6 @@ async def lifespan(_app: FastAPI):
     await init_db()
     await jobs.recover_interrupted()
     yield
-    await jobs.drain()
     await engine.dispose()
 
 

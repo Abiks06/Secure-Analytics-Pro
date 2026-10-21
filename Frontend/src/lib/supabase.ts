@@ -12,6 +12,9 @@ if (!url || !key) {
  * tokens rotate on every use and a reused one revokes the session (server-side reuse detection).
  * The analytics engine never sees passwords or refresh tokens, only the access token.
  */
+export const SUPABASE_URL: string = url;
+export const SUPABASE_KEY: string = key;
+
 export const supabase = createClient(url, key, {
   auth: {
     flowType: "pkce",

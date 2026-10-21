@@ -1,23 +1,26 @@
-"""Background processing with live progress.
+"""Dataset processing, streamed inside the request that triggers it.
 
-Uploads are processed in a bounded worker pool (CPU work runs in threads, off the event loop).
-Progress is fanned out to any number of subscribers through per-dataset queues; late subscribers
-immediately receive the latest state. The raw upload only ever lives in memory: plaintext is
-never written to disk, only the encrypted, cleaned Parquet.
+Serverless platforms freeze a function once its response ends, so work is never left running in
+the background: ``process_stream`` does the whole job while streaming progress events to the
+caller. The browser has already uploaded the file to the user's private Storage folder,
+encrypted with a one-time key; here it is downloaded, decrypted in memory, and the encrypted
+upload deleted. Plaintext never touches disk or Storage, only the encrypted, cleaned Parquet.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
-from collections import defaultdict
 from collections.abc import AsyncIterator
 from typing import Any
 
 import anyio
+from cryptography.exceptions import InvalidTag
 from sqlalchemy import select, text, update
 
+from app.core import crypto
 from app.core.config import get_settings
 from app.db.models import Dataset
 from app.db.session import claims_for, is_postgres, tenant_session
@@ -27,43 +30,8 @@ from app.services import audit, storage
 
 log = logging.getLogger("sap.jobs")
 
-
-class ProgressHub:
-    def __init__(self) -> None:
-        self._subs: dict[str, set[asyncio.Queue]] = defaultdict(set)
-        self._latest: dict[str, dict[str, Any]] = {}
-
-    def publish(self, dataset_id: str, event: dict[str, Any]) -> None:
-        self._latest[dataset_id] = event
-        for q in list(self._subs.get(dataset_id, ())):
-            try:
-                q.put_nowait(event)
-            except asyncio.QueueFull:
-                pass
-        if event.get("status") in ("ready", "failed"):
-            # Keep the terminal state briefly for late subscribers, then forget it.
-            asyncio.get_running_loop().call_later(60, self._latest.pop, dataset_id, None)
-
-    async def subscribe(self, dataset_id: str) -> AsyncIterator[dict[str, Any]]:
-        q: asyncio.Queue = asyncio.Queue(maxsize=100)
-        self._subs[dataset_id].add(q)
-        try:
-            if dataset_id in self._latest:
-                yield self._latest[dataset_id]
-            while True:
-                event = await q.get()
-                yield event
-                if event.get("status") in ("ready", "failed"):
-                    return
-        finally:
-            self._subs[dataset_id].discard(q)
-            if not self._subs[dataset_id]:
-                self._subs.pop(dataset_id, None)
-
-
-hub = ProgressHub()
 _semaphore: asyncio.Semaphore | None = None
-_tasks: set[asyncio.Task] = set()
+STALE_AFTER_S = 10 * 60
 
 
 def _sem() -> asyncio.Semaphore:
@@ -73,49 +41,87 @@ def _sem() -> asyncio.Semaphore:
     return _semaphore
 
 
-def submit(dataset_id: str, owner_id: str, data: bytes, ip: str, token: str) -> None:
-    """Queue processing. ``token`` is the uploader's access token, used only to write the
-    encrypted result to their Storage folder (processing takes seconds; tokens last an hour)."""
-    hub.publish(dataset_id, {"status": "queued", "stage": "queued", "progress": 0.0, "message": "Waiting for a worker"})
-    task = asyncio.create_task(_process(dataset_id, owner_id, data, ip, token))
-    _tasks.add(task)
-    task.add_done_callback(_tasks.discard)
+def upload_context(dataset_id: str) -> str:
+    """AES-GCM associated data binding a browser upload to its dataset."""
+    return f"upload:{dataset_id}"
 
 
-async def _set(owner_id: str, dataset_id: str, **values: Any) -> None:
+def _event(status: str, stage: str, progress: float, message: str | None = None) -> dict[str, Any]:
+    return {"status": status, "stage": stage, "progress": round(progress, 3), "message": message}
+
+
+async def _claim(owner_id: str, dataset_id: str) -> bool:
+    """Atomically move a dataset from queued to processing, so it is processed exactly once."""
     async with tenant_session(claims_for(owner_id)) as s:
-        await s.execute(update(Dataset).where(Dataset.id == dataset_id, Dataset.owner_id == owner_id).values(**values))
+        result = await s.execute(
+            update(Dataset)
+            .where(Dataset.id == dataset_id, Dataset.owner_id == owner_id, Dataset.status == "queued")
+            .values(status="processing", stage="validate", progress=0.0)
+        )
         await s.commit()
+        return bool(result.rowcount)
 
 
-async def _process(dataset_id: str, owner_id: str, data: bytes, ip: str, token: str) -> None:
-    loop = asyncio.get_running_loop()
+async def process_stream(
+    dataset_id: str, owner_id: str, key: bytes, ip: str, token: str
+) -> AsyncIterator[dict[str, Any]]:
     settings = get_settings()
-    async with _sem():
-        started = time.perf_counter()
+    if not await _claim(owner_id, dataset_id):
+        yield _event("failed", "failed", 1.0, "This upload was already processed or is not ready.")
+        return
 
-        def progress(stage: str, frac: float, message: str | None) -> None:
-            # Live progress goes to subscribers over SSE only; the database is written at the
-            # start and end of a job, keeping round trips to the managed database to a minimum.
-            event = {"status": "processing", "stage": stage, "progress": round(frac, 3), "message": message}
-            loop.call_soon_threadsafe(hub.publish, dataset_id, event)
+    started = time.perf_counter()
+    incoming = storage.incoming_path(owner_id, dataset_id)
+    try:
+        async with _sem():
+            yield _event("processing", "validate", 0.02, "Fetching encrypted upload")
+            try:
+                blob = await anyio.to_thread.run_sync(storage.get_raw, incoming, token)
+                data = crypto.decrypt_blob(key, blob, upload_context(dataset_id))
+            except (InvalidTag, ValueError) as e:
+                raise IngestError("The upload could not be decrypted. Please upload the file again.") from e
+            finally:
+                await anyio.to_thread.run_sync(storage.delete_paths, [incoming], token)
+            del blob
+            if len(data) > settings.max_upload_mb * 1024 * 1024:
+                raise IngestError(f"File exceeds the {settings.max_upload_mb} MB limit.")
+            digest = hashlib.sha256(data).hexdigest()
+            async with tenant_session(claims_for(owner_id)) as s:
+                await s.execute(
+                    update(Dataset).where(Dataset.id == dataset_id).values(size_bytes=len(data), sha256=digest)
+                )
+                await audit.record(
+                    s,
+                    owner_id,
+                    "dataset.upload",
+                    target=dataset_id,
+                    ip=ip,
+                    detail={"bytes": len(data), "sha256": digest, "client_encrypted": True},
+                )
+                await s.commit()
 
-        try:
-            await _set(owner_id, dataset_id, status="processing", stage="validate", progress=0.0)
-            out = await anyio.to_thread.run_sync(
-                lambda: pipeline.run(
-                    data, max_decompressed=settings.max_decompressed_mb * 1024 * 1024, progress=progress
+            # Run the CPU-bound pipeline in a worker thread and relay its progress as it happens.
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+            def progress(stage: str, frac: float, message: str | None) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, _event("processing", stage, frac, message))
+
+            work = asyncio.ensure_future(
+                anyio.to_thread.run_sync(
+                    lambda: pipeline.run(
+                        data, max_decompressed=settings.max_decompressed_mb * 1024 * 1024, progress=progress
+                    )
                 )
             )
-            hub.publish(
-                dataset_id,
-                {
-                    "status": "processing",
-                    "stage": "secure",
-                    "progress": round(6 / 7, 3),
-                    "message": "AES-256-GCM, per-dataset key",
-                },
-            )
+            while not (work.done() and queue.empty()):
+                try:
+                    yield await asyncio.wait_for(queue.get(), timeout=0.25)
+                except TimeoutError:
+                    continue
+            out = work.result()
+
+            yield _event("processing", "secure", 6 / 7, "AES-256-GCM, per-dataset key")
             t_secure = time.perf_counter()
             wrapped, stored, path = await anyio.to_thread.run_sync(
                 storage.save_frame, owner_id, dataset_id, out.frame, token
@@ -165,15 +171,20 @@ async def _process(dataset_id: str, owner_id: str, data: bytes, ip: str, token: 
                     },
                 )
                 await s.commit()
-            hub.publish(
-                dataset_id,
-                {"status": "ready", "stage": "ready", "progress": 1.0, "message": f"Done in {elapsed / 1000:.2f}s"},
-            )
-        except IngestError as e:
-            await _fail(owner_id, dataset_id, str(e), ip)
-        except Exception:
-            log.exception("processing failed for %s", dataset_id)
-            await _fail(owner_id, dataset_id, "Processing failed unexpectedly. The file may be malformed.", ip)
+            yield _event("ready", "ready", 1.0, f"Done in {elapsed / 1000:.2f}s")
+    except IngestError as e:
+        await _fail(owner_id, dataset_id, str(e), ip)
+        yield _event("failed", "failed", 1.0, str(e))
+    except storage.StorageError as e:
+        log.warning("storage error for %s: %s", dataset_id, e)
+        message = "The encrypted upload could not be read from storage. Please upload again."
+        await _fail(owner_id, dataset_id, message, ip)
+        yield _event("failed", "failed", 1.0, message)
+    except Exception:
+        log.exception("processing failed for %s", dataset_id)
+        message = "Processing failed unexpectedly. The file may be malformed."
+        await _fail(owner_id, dataset_id, message, ip)
+        yield _event("failed", "failed", 1.0, message)
 
 
 async def _fail(owner_id: str, dataset_id: str, message: str, ip: str) -> None:
@@ -185,29 +196,18 @@ async def _fail(owner_id: str, dataset_id: str, message: str, ip: str) -> None:
         )
         await audit.record(s, owner_id, "dataset.failed", target=dataset_id, ip=ip, detail={"error": message})
         await s.commit()
-    hub.publish(dataset_id, {"status": "failed", "stage": "failed", "progress": 1.0, "message": message})
 
 
 async def recover_interrupted() -> None:
-    """Raw uploads are memory-only, so jobs cut off by a restart cannot resume; mark them failed."""
+    """Jobs cut off mid-flight (closed tab, function timeout, restart) cannot resume because
+    the plaintext only ever lived in memory; mark long-stalled ones failed."""
     async with tenant_session(None) as s:
         if is_postgres:
             # RLS hides every row from an unscoped session; this one cross-tenant chore goes
             # through a SECURITY DEFINER function that only sap_engine may execute.
-            await s.execute(text("select sap.fail_interrupted_jobs()"))
+            await s.execute(text("select sap.fail_interrupted_jobs(make_interval(secs => :s))"), {"s": STALE_AFTER_S})
         else:
-            rows = (
-                (await s.execute(select(Dataset).where(Dataset.status.in_(["queued", "processing"])))).scalars().all()
-            )
+            rows = (await s.execute(select(Dataset).where(Dataset.status == "processing"))).scalars().all()
             for ds in rows:
-                ds.status, ds.stage, ds.error = (
-                    "failed",
-                    "failed",
-                    "Interrupted by a server restart. Please upload again.",
-                )
+                ds.status, ds.stage, ds.error = "failed", "failed", "Interrupted. Please upload again."
         await s.commit()
-
-
-async def drain(timeout: float = 30) -> None:
-    if _tasks:
-        await asyncio.wait(_tasks, timeout=timeout)

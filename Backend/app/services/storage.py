@@ -34,6 +34,11 @@ def object_path(owner_id: str, dataset_id: str) -> str:
     return f"{owner_id}/{dataset_id}.sap"
 
 
+def incoming_path(owner_id: str, dataset_id: str) -> str:
+    """Where the browser uploads the client-side encrypted original; deleted once processed."""
+    return f"{owner_id}/incoming/{dataset_id}.upload"
+
+
 def _context(dataset_id: str) -> str:
     return f"dataset:{dataset_id}"
 
@@ -85,24 +90,37 @@ def _get(path: str, token: str) -> bytes:
     return r.content
 
 
-def _delete(path: str, token: str) -> None:
+def delete_paths(paths: list[str], token: str) -> None:
+    """Delete objects (best effort for paths that don't exist)."""
     s = get_settings()
+    paths = [p for p in paths if p]
+    if not paths:
+        return
     if s.blob_backend == "local":
-        f = _local_file(path)
-        if f.exists():
-            with f.open("r+b") as fh:
-                fh.write(os.urandom(min(f.stat().st_size, 1 << 20)))
-            f.unlink()
+        for path in paths:
+            f = _local_file(path)
+            if f.exists():
+                with f.open("r+b") as fh:
+                    fh.write(os.urandom(min(f.stat().st_size, 1 << 20)))
+                f.unlink()
         return
     r = httpx.request(
         "DELETE",
         f"{s.supabase_url}/storage/v1/object/{BUCKET}",
-        json={"prefixes": [path]},
+        json={"prefixes": paths},
         headers=_headers(token),
         timeout=30,
     )
     if r.status_code >= 300:
         raise StorageError(f"Storage delete failed ({r.status_code})")
+
+
+def get_raw(path: str, token: str) -> bytes:
+    return _get(path, token)
+
+
+def put_raw(path: str, blob: bytes, token: str) -> None:
+    _put(path, blob, token)
 
 
 # --- public API ------------------------------------------------------------------------------
@@ -135,12 +153,11 @@ def load_frame(dataset_id: str, wrapped: bytes, path: str, token: str) -> pl.Dat
     return df
 
 
-def shred(dataset_id: str, path: str | None, token: str) -> None:
-    """Crypto-shred: drop the cache and delete the ciphertext. The caller deletes the wrapped
+def shred(dataset_id: str, paths: list[str | None], token: str) -> None:
+    """Crypto-shred: drop the cache and delete the ciphertext(s). The caller deletes the wrapped
     key, after which no copy of the data (including Storage backups) is readable."""
     cache.drop(dataset_id)
-    if path:
-        _delete(path, token)
+    delete_paths([p for p in paths if p], token)
 
 
 class FrameCache:

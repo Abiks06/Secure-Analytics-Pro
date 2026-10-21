@@ -80,6 +80,25 @@ Open http://localhost:5173. To enable the AI analyst, set `ANTHROPIC_API_KEY` fo
 
 **Latency:** deploy the engine in the **same region as the Supabase project**. Each API call makes a couple of database round trips, which take about 1 ms in-region but over 100 ms across continents.
 
+### Vercel (production)
+
+`vercel.json` deploys the app as one Vercel project with two [Services](https://vercel.com/docs/services): the Vite frontend (`web`) and the FastAPI engine (`api`, receiving `/api/*`). Set the function region to **lhr1** (London), next to the Supabase project, and add these environment variables:
+
+| Variable | Value |
+| --- | --- |
+| `SAP_ENV` | `prod` |
+| `SAP_DATABASE_URL` | session-pooler URL for `sap_engine` (sensitive) |
+| `SAP_MASTER_KEY` | 32-byte base64 key-encryption key (sensitive, and back it up: losing it makes every dataset unreadable) |
+| `SAP_SUPABASE_URL`, `SAP_SUPABASE_PUBLISHABLE_KEY` | project URL and publishable key |
+| `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY` | the same two values, for the frontend build |
+| `ANTHROPIC_API_KEY` | optional, enables the AI analyst |
+
+The serverless design shapes three things:
+
+- **Uploads bypass the 4.5 MB function request limit:** the browser encrypts each file with a one-time AES-256-GCM key and uploads the ciphertext straight to the user's private Storage folder. The engine decrypts it in memory, then deletes the encrypted upload.
+- **Processing runs inside the request that streams its progress,** because serverless functions don't keep running after a response ends.
+- **Uploads are capped at 45 MB** by the Supabase free plan's 50 MB object limit, and **exports at about 4.5 MB** by Vercel's response size limit.
+
 ### Docker
 
 ```bash

@@ -1,19 +1,20 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import anyio
 import polars as pl
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import undefer
-from sse_starlette.sse import EventSourceResponse
 
 from app.api.deps import Principal, client_ip, current
 from app.core import ratelimit
@@ -130,45 +131,78 @@ def scrubbed_report(ds: Dataset) -> dict[str, Any]:
     return report
 
 
-@router.post("", status_code=202)
-async def upload(
-    request: Request,
-    file: UploadFile = File(...),
+_NAME = re.compile(r"[^\w .()\-]+")
+
+
+class CreateBody(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    size_bytes: int = Field(ge=1)
+
+
+@router.post("", status_code=201)
+async def create(
+    body: CreateBody,
     p: Principal = Depends(current),
     _rl: None = Depends(ratelimit.limit(ratelimit.UPLOAD)),
 ) -> dict[str, Any]:
-    limit = get_settings().max_upload_mb * 1024 * 1024
-    digest = hashlib.sha256()
-    buf = bytearray()
-    while chunk := await file.read(1 << 20):
-        buf += chunk
-        digest.update(chunk)
-        if len(buf) > limit:
-            raise HTTPException(413, detail=f"File exceeds the {get_settings().max_upload_mb} MB limit.")
-    if not buf:
-        raise HTTPException(400, detail="The file is empty.")
-    name = (
-        re.sub(r"[^\w .()\-]+", "_", (file.filename or "dataset").rsplit("/", 1)[-1].rsplit("\\", 1)[-1])[:200]
-        or "dataset"
-    )
-    ds = Dataset(owner_id=p.user_id, name=name, size_bytes=len(buf), sha256=digest.hexdigest())
+    """Register an upload. The browser then encrypts the file with a one-time key, uploads the
+    ciphertext to ``upload_path`` in its private Storage folder, and calls ``/process``."""
+    limit = get_settings().max_upload_mb
+    if body.size_bytes > limit * 1024 * 1024:
+        raise HTTPException(413, detail=f"File exceeds the {limit} MB limit.")
+    name = _NAME.sub("_", body.name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1])[:200].strip() or "dataset"
+    ds = Dataset(owner_id=p.user_id, name=name, size_bytes=body.size_bytes)
     p.db.add(ds)
-    await p.db.flush()
-    await audit.record(
-        p.db,
-        p.user_id,
-        "dataset.upload",
-        target=ds.id,
-        ip=client_ip(request),
-        detail={"name": name, "bytes": len(buf), "sha256": ds.sha256},
-    )
     await p.db.commit()
-    jobs.submit(ds.id, p.user_id, bytes(buf), client_ip(request), p.token)
-    return summary(ds)
+    return {
+        **summary(ds),
+        "upload_path": storage.incoming_path(p.user_id, ds.id),
+        "upload_context": jobs.upload_context(ds.id),
+    }
+
+
+class ProcessBody(BaseModel):
+    key: str = Field(min_length=40, max_length=64, description="Base64 AES-256 key for the encrypted upload")
+
+
+@router.post("/{dataset_id}/process")
+async def process(
+    dataset_id: str, body: ProcessBody, request: Request, p: Principal = Depends(current)
+) -> StreamingResponse:
+    """Decrypt, analyse and store the uploaded file, streaming progress as Server-Sent Events.
+    The one-time key is used in memory only and never stored."""
+    ds = await _get(p, dataset_id)
+    if ds.status != "queued":
+        raise HTTPException(409, detail=f"Dataset is {ds.status}")
+    try:
+        key = base64.b64decode(body.key, validate=True)
+    except ValueError as e:
+        raise HTTPException(422, detail="Invalid key encoding") from e
+    if len(key) != 32:
+        raise HTTPException(422, detail="Key must be 256 bits")
+    owner, token, ip = p.user_id, p.token, client_ip(request)
+    await p.db.close()
+
+    async def stream():
+        async for event in jobs.process_stream(dataset_id, owner, key, ip, token):
+            yield f"event: progress\ndata: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
+    )
 
 
 @router.get("")
 async def list_datasets(p: Principal = Depends(current)) -> list[dict[str, Any]]:
+    # A job whose request died (tab closed, timeout) can never finish: its plaintext lived
+    # only in that request's memory. Surface it as failed instead of spinning forever.
+    stale = datetime.now(UTC) - timedelta(seconds=jobs.STALE_AFTER_S)
+    await p.db.execute(
+        update(Dataset)
+        .where(Dataset.owner_id == p.user_id, Dataset.status.in_(["queued", "processing"]), Dataset.updated_at < stale)
+        .values(status="failed", stage="failed", error="Upload was interrupted. Please upload the file again.")
+    )
+    await p.db.commit()
     rows = (
         (await p.db.execute(select(Dataset).where(Dataset.owner_id == p.user_id).order_by(Dataset.created_at.desc())))
         .scalars()
@@ -187,23 +221,6 @@ async def get_report(dataset_id: str, p: Principal = Depends(current)) -> dict[s
     ds = await _get(p, dataset_id, ready=True)
     report = await anyio.to_thread.run_sync(scrubbed_report, ds)
     return {"dataset": summary(ds), "report": report}
-
-
-@router.get("/{dataset_id}/events")
-async def events(dataset_id: str, p: Principal = Depends(current)) -> EventSourceResponse:
-    ds = await _get(p, dataset_id)
-    initial = {"status": ds.status, "stage": ds.stage, "progress": ds.progress, "message": ds.error}
-    terminal = ds.status in ("ready", "failed")
-    await p.db.close()
-
-    async def stream():
-        yield {"event": "progress", "data": json.dumps(initial)}
-        if terminal:
-            return
-        async for event in jobs.hub.subscribe(dataset_id):
-            yield {"event": "progress", "data": json.dumps(event)}
-
-    return EventSourceResponse(stream(), ping=15)
 
 
 class RenameBody(BaseModel):
@@ -424,10 +441,11 @@ async def export(
 @router.delete("/{dataset_id}", status_code=204)
 async def delete(dataset_id: str, request: Request, p: Principal = Depends(current)) -> None:
     ds = await _get(p, dataset_id)
-    if ds.status in ("queued", "processing"):
+    if ds.status == "processing":
         raise HTTPException(409, detail="Wait for processing to finish before deleting.")
     try:
-        await anyio.to_thread.run_sync(storage.shred, ds.id, ds.storage_path, p.token)
+        paths = [ds.storage_path, storage.incoming_path(p.user_id, ds.id)]
+        await anyio.to_thread.run_sync(storage.shred, ds.id, paths, p.token)
     except storage.StorageError as e:
         raise HTTPException(502, detail="Could not delete the encrypted file from storage; nothing was removed.") from e
     await audit.record(

@@ -1,10 +1,10 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Check, FileUp, FlaskConical, Loader2, UploadCloud, X } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import { toast } from "sonner";
-import { api, ApiError, streamProgress } from "../lib/api";
+import { api, ApiError } from "../lib/api";
 import { bytes } from "../lib/format";
 import type { ProgressEvent } from "../lib/types";
 import { Button, Card, cx } from "./ui";
@@ -23,38 +23,20 @@ interface Job {
   key: string;
   name: string;
   size: number;
+  phase: "encrypt" | "upload" | "process";
   upload: number;
   id?: string;
   event?: ProgressEvent;
   error?: string;
 }
 
-function JobRow({ job, onDone, onDismiss }: { job: Job; onDone: (id: string, ok: boolean, message?: string | null) => void; onDismiss: () => void }) {
-  const [event, setEvent] = useState<ProgressEvent | undefined>(job.event);
+function JobRow({ job, onDismiss }: { job: Job; onDismiss: () => void }) {
   const navigate = useNavigate();
-  const finished = useRef(false);
-
-  useEffect(() => {
-    if (!job.id) return;
-    const ctrl = new AbortController();
-    streamProgress(
-      job.id,
-      (e) => {
-        setEvent(e);
-        if ((e.status === "ready" || e.status === "failed") && !finished.current) {
-          finished.current = true;
-          onDone(job.id!, e.status === "ready", e.message);
-        }
-      },
-      ctrl.signal,
-    ).catch(() => undefined);
-    return () => ctrl.abort();
-  }, [job.id, onDone]);
-
+  const event = job.event;
   const stageIdx = event ? PIPELINE.findIndex((s) => s.id === event.stage) : -1;
   const ready = event?.status === "ready";
   const failed = event?.status === "failed" || !!job.error;
-  const uploading = !job.id && !job.error;
+  const uploading = job.phase !== "process" && !job.error;
 
   return (
     <motion.div layout initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, scale: 0.97 }} className="rounded-xl border border-white/[0.07] bg-ink-900/60 p-4">
@@ -67,7 +49,9 @@ function JobRow({ job, onDone, onDismiss }: { job: Job; onDone: (id: string, ok:
           <div className="truncate text-[12px] text-fg-subtle">
             {bytes(job.size)} ·{" "}
             {uploading
-              ? `Uploading ${Math.round(job.upload * 100)}%`
+              ? job.phase === "encrypt"
+                ? "Encrypting in your browser"
+                : `Uploading encrypted file ${Math.round(job.upload * 100)}%`
               : failed
                 ? <span className="text-sev-critical">{job.error ?? event?.message}</span>
                 : ready
@@ -109,7 +93,7 @@ function JobRow({ job, onDone, onDismiss }: { job: Job; onDone: (id: string, ok:
   );
 }
 
-export function UploadPanel({ maxMb = 200 }: { maxMb?: number }) {
+export function UploadPanel({ maxMb = 45 }: { maxMb?: number }) {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [drag, setDrag] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -118,26 +102,7 @@ export function UploadPanel({ maxMb = 200 }: { maxMb?: number }) {
 
   const patch = (key: string, p: Partial<Job>) => setJobs((js) => js.map((j) => (j.key === key ? { ...j, ...p } : j)));
 
-  const start = useCallback(
-    async (file: File) => {
-      const key = `${file.name}-${Date.now()}-${Math.random()}`;
-      if (file.size > maxMb * 1024 * 1024) {
-        toast.error(`${file.name} is larger than ${maxMb} MB`);
-        return;
-      }
-      setJobs((js) => [{ key, name: file.name, size: file.size, upload: 0 }, ...js]);
-      try {
-        const ds = await api.upload(file, (f) => patch(key, { upload: f }));
-        patch(key, { id: ds.id, upload: 1 });
-        qc.invalidateQueries({ queryKey: ["datasets"] });
-      } catch (e) {
-        patch(key, { error: e instanceof ApiError ? e.message : "Upload failed" });
-      }
-    },
-    [maxMb, qc],
-  );
-
-  const onDone = useCallback(
+  const finish = useCallback(
     (id: string, ok: boolean, message?: string | null) => {
       qc.invalidateQueries({ queryKey: ["datasets"] });
       qc.invalidateQueries({ queryKey: ["system"] });
@@ -145,6 +110,34 @@ export function UploadPanel({ maxMb = 200 }: { maxMb?: number }) {
       else toast.error("Processing failed", { description: message ?? undefined });
     },
     [qc, navigate],
+  );
+
+  const start = useCallback(
+    async (file: File) => {
+      const key = `${file.name}-${Date.now()}-${Math.random()}`;
+      if (file.size > maxMb * 1024 * 1024) {
+        toast.error(`${file.name} is larger than ${maxMb} MB`);
+        return;
+      }
+      setJobs((js) => [{ key, name: file.name, size: file.size, phase: "encrypt", upload: 0 }, ...js]);
+      let last: ProgressEvent | undefined;
+      try {
+        const ds = await api.upload(file, {
+          onUpload: (f) => patch(key, { phase: "upload", upload: f }),
+          onEvent: (e) => {
+            last = e;
+            patch(key, { event: e, phase: e.stage === "encrypt" ? "encrypt" : "process" });
+          },
+        });
+        patch(key, { id: ds.id, upload: 1 });
+        if (last?.status === "ready" || last?.status === "failed") finish(ds.id, last.status === "ready", last.message);
+        else patch(key, { error: "Connection lost while processing. Check the dataset list shortly." });
+        qc.invalidateQueries({ queryKey: ["datasets"] });
+      } catch (e) {
+        patch(key, { error: e instanceof ApiError ? e.message : "Upload failed" });
+      }
+    },
+    [maxMb, qc, finish],
   );
 
   const onFiles = (files: FileList | null) => {
@@ -209,7 +202,7 @@ export function UploadPanel({ maxMb = 200 }: { maxMb?: number }) {
           <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="space-y-2 px-1 pb-1 pt-2">
             <AnimatePresence initial={false}>
               {jobs.map((j) => (
-                <JobRow key={j.key} job={j} onDone={onDone} onDismiss={() => setJobs((js) => js.filter((x) => x.key !== j.key))} />
+                <JobRow key={j.key} job={j} onDismiss={() => setJobs((js) => js.filter((x) => x.key !== j.key))} />
               ))}
             </AnimatePresence>
           </motion.div>

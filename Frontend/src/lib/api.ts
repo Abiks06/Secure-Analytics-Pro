@@ -13,7 +13,8 @@ import type {
   User,
 } from "./types";
 import type { AuthError, Session } from "@supabase/supabase-js";
-import { supabase } from "./supabase";
+import { encryptForUpload } from "./encrypt";
+import { SUPABASE_KEY, SUPABASE_URL, supabase } from "./supabase";
 
 /**
  * Session state mirrors Supabase Auth. supabase-js refreshes the access token before it
@@ -165,33 +166,28 @@ export const api = {
     if (p.q) qs.set("q", p.q);
     return json<RowsPage>(`/api/datasets/${id}/rows?${qs}`);
   },
-  upload: (file: File, onProgress?: (fraction: number) => void) =>
-    new Promise<DatasetSummary>((resolve, reject) => {
-      // XHR (not fetch) so the UI can show real upload progress.
-      const send = (retry: boolean) => {
-        const xhr = new XMLHttpRequest();
-        xhr.open("POST", "/api/datasets");
-        const token = useAuth.getState().token;
-        if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-        xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);
-        xhr.onload = async () => {
-          if (xhr.status === 401 && retry && (await refreshSession())) return send(false);
-          let body: { detail?: string } & Partial<DatasetSummary> = {};
-          try {
-            body = JSON.parse(xhr.responseText);
-          } catch {
-            /* ignore */
-          }
-          if (xhr.status >= 200 && xhr.status < 300) resolve(body as DatasetSummary);
-          else reject(new ApiError(xhr.status, body.detail ?? "Upload failed"));
-        };
-        xhr.onerror = () => reject(new ApiError(0, "Network error during upload"));
-        const form = new FormData();
-        form.append("file", file);
-        xhr.send(form);
-      };
-      send(true);
-    }),
+  /**
+   * Upload flow: register the dataset, encrypt the file in the browser with a one-time key,
+   * upload the ciphertext straight to the user's private Storage folder, then ask the engine to
+   * process it while streaming progress back. Plaintext never leaves the browser except inside
+   * the TLS request that hands the engine the one-time key.
+   */
+  upload: async (file: File, handlers: { onUpload?: (fraction: number) => void; onEvent: (e: ProgressEvent) => void }) => {
+    const created = await json<DatasetSummary & { upload_path: string; upload_context: string }>("/api/datasets", {
+      method: "POST",
+      body: JSON.stringify({ name: file.name, size_bytes: file.size }),
+    });
+    handlers.onEvent({ status: "queued", stage: "encrypt", progress: 0, message: "Encrypting in your browser" });
+    const { blob, keyB64 } = await encryptForUpload(file, created.upload_context);
+    await putToStorage(created.upload_path, blob, handlers.onUpload);
+    const res = await request(`/api/datasets/${created.id}/process`, {
+      method: "POST",
+      body: JSON.stringify({ key: keyB64 }),
+      headers: { Accept: "text/event-stream" },
+    });
+    await readEvents(res, handlers.onEvent);
+    return created as DatasetSummary;
+  },
   rename: (id: string, name: string) =>
     json<DatasetSummary>(`/api/datasets/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
   remove: (id: string) => json<void>(`/api/datasets/${id}`, { method: "DELETE" }),
@@ -213,12 +209,33 @@ export const api = {
   },
 };
 
-/**
- * Server-Sent Events over fetch (EventSource cannot send an Authorization header).
- * Calls `onEvent` for each progress event until the stream ends or `signal` aborts.
- */
-export async function streamProgress(id: string, onEvent: (e: ProgressEvent) => void, signal: AbortSignal) {
-  const res = await request(`/api/datasets/${id}/events`, { signal, headers: { Accept: "text/event-stream" } });
+/** PUT ciphertext into the caller's Storage folder via XHR, for real upload progress. */
+function putToStorage(path: string, blob: Blob, onProgress?: (fraction: number) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${SUPABASE_URL}/storage/v1/object/datasets/${path}`);
+    xhr.setRequestHeader("Authorization", `Bearer ${useAuth.getState().token}`);
+    xhr.setRequestHeader("apikey", SUPABASE_KEY);
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.setRequestHeader("x-upsert", "false");
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress?.(e.loaded / e.total);
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) return resolve();
+      let message = "Upload to secure storage failed";
+      try {
+        message = JSON.parse(xhr.responseText).message ?? message;
+      } catch {
+        /* ignore */
+      }
+      reject(new ApiError(xhr.status, message));
+    };
+    xhr.onerror = () => reject(new ApiError(0, "Network error during upload"));
+    xhr.send(blob);
+  });
+}
+
+/** Read a Server-Sent Events response body, calling `onEvent` for each progress event. */
+async function readEvents(res: Response, onEvent: (e: ProgressEvent) => void) {
   const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
   while (true) {
@@ -238,7 +255,7 @@ export async function streamProgress(id: string, onEvent: (e: ProgressEvent) => 
         try {
           onEvent(JSON.parse(data) as ProgressEvent);
         } catch {
-          /* keep-alive or partial */
+          /* partial */
         }
       }
     }

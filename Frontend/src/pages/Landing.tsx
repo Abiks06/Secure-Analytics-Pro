@@ -64,7 +64,7 @@ function ProductPreview() {
         <span className="size-2.5 rounded-full bg-[#fb7185]/80" />
         <span className="size-2.5 rounded-full bg-[#fbbf24]/80" />
         <span className="size-2.5 rounded-full bg-[#34d399]/80" />
-        <span className="ml-3 truncate font-mono text-[11px] text-fg-subtle">messy_sales_export (3).csv · 5,050 rows</span>
+        <span className="ml-3 min-w-0 truncate font-mono text-[11px] text-fg-subtle">messy_sales_export (3).csv · 5,050 rows</span>
         <span className="ml-auto flex items-center gap-1.5 rounded-full bg-mint/10 px-2 py-0.5 text-[10.5px] font-medium text-mint">
           <Lock className="size-3" /> encrypted
         </span>
@@ -264,7 +264,7 @@ export default function Landing() {
         </div>
       </header>
 
-      <section className="mx-auto grid max-w-7xl items-center gap-14 px-4 pb-20 pt-16 sm:px-6 lg:grid-cols-[1.05fr_1fr] lg:pt-24">
+      <section className="mx-auto grid max-w-7xl grid-cols-1 items-center gap-14 px-4 pb-20 pt-16 sm:px-6 lg:grid-cols-[1.05fr_1fr] lg:pt-24">
         <div>
           <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.6, ease }}>
             <span className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-[12px] text-fg-muted">
@@ -311,7 +311,7 @@ export default function Landing() {
             ))}
           </motion.div>
         </div>
-        <motion.div initial={{ opacity: 0, y: 30, rotateX: 8 }} animate={{ opacity: 1, y: 0, rotateX: 0 }} transition={{ duration: 1, delay: 0.2, ease }} style={{ perspective: 1200 }}>
+        <motion.div initial={{ opacity: 0, y: 30, rotateX: 8 }} animate={{ opacity: 1, y: 0, rotateX: 0 }} transition={{ duration: 1, delay: 0.2, ease }} style={{ perspective: 1200 }} className="min-w-0">
           <ProductPreview />
         </motion.div>
       </section>

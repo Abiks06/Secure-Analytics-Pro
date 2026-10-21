@@ -6,13 +6,13 @@ requires-python = ">=3.13"
 dependencies = [
     "aiosqlite>=0.22.1",
     "anthropic>=1.17.0",
-    "argon2-cffi>=25.1.0",
     "asyncpg>=0.32.0",
     "charset-normalizer>=3.5.2",
     "cryptography>=50.0.2",
     "duckdb>=2.0.0",
     "fastapi>=0.157.0",
     "fastexcel>=0.21.0",
+    "httpx>=0.28.1",
     "numpy>=2.5.4",
     "polars>=2.0.0",
     "pyarrow>=26.0.0",
@@ -29,7 +29,6 @@ package = false
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.17.1",

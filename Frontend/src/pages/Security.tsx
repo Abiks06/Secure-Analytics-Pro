@@ -20,6 +20,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { motion } from "motion/react";
+import { useNavigate } from "react-router";
 import { toast } from "sonner";
 import { Badge, Button, Card, CardHeader, cx, Skeleton } from "../components/ui";
 import { api, ApiError } from "../lib/api";
@@ -29,6 +30,7 @@ import type { AuditEvent } from "../lib/types";
 const ACTIONS: Record<string, { label: string; icon: React.ReactNode; tone: string }> = {
   "auth.register": { label: "Account created", icon: <KeyRound className="size-3.5" />, tone: "text-brand-300" },
   "auth.login": { label: "Signed in", icon: <LogIn className="size-3.5" />, tone: "text-mint" },
+  "auth.session_started": { label: "Signed in", icon: <LogIn className="size-3.5" />, tone: "text-mint" },
   "auth.login_failed": { label: "Failed sign-in", icon: <ShieldAlert className="size-3.5" />, tone: "text-sev-critical" },
   "auth.logout": { label: "Signed out", icon: <LogOut className="size-3.5" />, tone: "text-fg-muted" },
   "auth.session_revoked": { label: "Session revoked", icon: <XCircle className="size-3.5" />, tone: "text-sev-warning" },
@@ -68,6 +70,7 @@ function parseUA(ua: string) {
 
 export default function Security() {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const system = useQuery({ queryKey: ["system"], queryFn: api.system });
   const audit = useQuery({ queryKey: ["audit"], queryFn: () => api.audit() });
   const verify = useQuery({ queryKey: ["audit-verify"], queryFn: api.verifyAudit });
@@ -85,9 +88,9 @@ export default function Security() {
   const posture = system.data
     ? [
         { icon: <KeyRound className="size-4" />, label: "Encryption at rest", value: system.data.encryption },
-        { icon: <ShieldCheck className="size-4" />, label: "Password hashing", value: system.data.password_hashing },
-        { icon: <Activity className="size-4" />, label: "Token signing", value: system.data.token_signing },
-        { icon: <Database className="size-4" />, label: "Tenant isolation", value: system.data.database === "postgresql+rls" ? "PostgreSQL forced Row Level Security" : "Owner-scoped queries (enable Postgres for RLS)" },
+        { icon: <ShieldCheck className="size-4" />, label: "Identity", value: system.data.auth },
+        { icon: <Activity className="size-4" />, label: "Encrypted file storage", value: system.data.storage },
+        { icon: <Database className="size-4" />, label: "Tenant isolation", value: system.data.database === "supabase" ? "Supabase Postgres · forced RLS via a least-privilege engine role" : "Owner-scoped queries (offline mode)" },
         { icon: <Eye className="size-4" />, label: "AI data exposure", value: system.data.ai_enabled ? "Schema, aggregates and masked results only" : "AI disabled" },
       ]
     : [];
@@ -164,7 +167,24 @@ export default function Security() {
 
         <div className="space-y-4">
           <Card>
-            <CardHeader title="Active sessions" subtitle="Refresh tokens rotate on every use" icon={<Laptop className="size-4" />} />
+            <CardHeader
+              title="Active sessions"
+              subtitle="Supabase Auth · refresh tokens rotate on every use"
+              icon={<Laptop className="size-4" />}
+              action={
+                <Button
+                  size="sm"
+                  variant="danger"
+                  onClick={async () => {
+                    if (!window.confirm("Sign out of every device, including this one?")) return;
+                    await api.logout("global");
+                    navigate("/login");
+                  }}
+                >
+                  Sign out everywhere
+                </Button>
+              }
+            />
             <div className="space-y-1 p-3">
               {sessions.data?.map((s) => (
                 <div key={s.id} className="flex items-center gap-3 rounded-xl px-2 py-2.5">
@@ -176,7 +196,9 @@ export default function Security() {
                       {parseUA(s.user_agent)} {s.current && <Badge tone="positive">this device</Badge>}
                     </div>
                     <div className="text-[12px] text-fg-subtle">
-                      {s.ip || "unknown IP"} · active {ago(s.last_used_at)}
+                      {s.ip || "unknown IP"}
+                      {s.last_used_at && <> · active {ago(s.last_used_at)}</>}
+                      {s.aal === "aal2" && <> · MFA</>}
                     </div>
                   </div>
                   {!s.current && (

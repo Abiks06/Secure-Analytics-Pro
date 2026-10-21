@@ -57,7 +57,7 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
         </div>
         <div className="mt-1.5 flex items-center gap-2 text-[12px] text-fg-muted">
           <Database className="size-3.5 text-cyan-glow" />
-          {system?.database === "postgresql+rls" ? "Postgres · Row Level Security" : "SQLite · tenant-filtered"}
+          {system?.database === "supabase" ? "Supabase · Row Level Security" : "Offline · tenant-filtered"}
         </div>
       </div>
 

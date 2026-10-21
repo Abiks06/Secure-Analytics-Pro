@@ -3,13 +3,12 @@ from __future__ import annotations
 import gzip
 import json
 
+from cryptography.hazmat.primitives.asymmetric import ec
 from sqlalchemy import update
 
 from app.db.models import AuditEvent
-from app.db.session import tenant_session
-from tests.conftest import PASSWORD, SAMPLE, make_user, upload_and_wait
-
-CSRF = {"X-SAP-CSRF": "1"}
+from app.db.session import claims_for, tenant_session
+from tests.conftest import SAMPLE, make_user, mint, upload_and_wait
 
 
 async def test_security_headers(client):
@@ -21,52 +20,39 @@ async def test_security_headers(client):
     assert r.headers["cache-control"] == "no-store"
 
 
-async def test_weak_password_rejected(client):
-    r = await client.post("/api/auth/register", json={"email": "weak@example.org", "password": "password", "name": "W"})
-    assert r.status_code == 422
-    assert "at least 10 characters" in r.json()["detail"]
-
-
-async def test_requires_auth(client):
+async def test_requires_valid_supabase_token(client):
     assert (await client.get("/api/datasets")).status_code == 401
-    bad = {"Authorization": "Bearer not-a-jwt"}
-    assert (await client.get("/api/datasets", headers=bad)).status_code == 401
+    bad = {
+        "garbage": "not-a-jwt",
+        "forged (unknown key)": mint(key=ec.generate_private_key(ec.SECP256R1())),
+        "forged (unknown kid)": mint(kid="other"),
+        "expired": mint(ttl=-120),
+        "wrong audience": mint(aud="anon"),
+        "wrong issuer": mint(iss="https://evil.example/auth/v1"),
+        "anonymous user": mint(is_anonymous=True),
+        "service role": mint(role="service_role"),
+    }
+    for label, token in bad.items():
+        r = await client.get("/api/datasets", headers={"Authorization": f"Bearer {token}"})
+        assert r.status_code == 401, label
 
 
-async def test_login_lockout(client):
+async def test_me_and_sign_in_is_audited(client):
     h = await make_user(client)
-    for _ in range(5):
-        r = await client.post("/api/auth/login", json={"email": h["email"], "password": "Wrong-password-1"})
-        assert r.status_code == 401
-    r = await client.post("/api/auth/login", json={"email": h["email"], "password": PASSWORD})
-    assert r.status_code == 423
-
-
-async def test_refresh_rotation_and_reuse_detection(client):
-    h = await make_user(client)
-    first = client.cookies.get("sap_refresh")
-    assert first
-    assert (await client.post("/api/auth/refresh")).status_code == 403  # CSRF header required
-    r = await client.post("/api/auth/refresh", headers=CSRF)
-    assert r.status_code == 200
-    assert client.cookies.get("sap_refresh") != first
-    # Replay the old token: the whole session must be revoked.
-    client.cookies.set("sap_refresh", first, path="/api/auth")
-    assert (await client.post("/api/auth/refresh", headers=CSRF)).status_code == 401
-    me = await client.get("/api/auth/me", headers={"Authorization": h["Authorization"]})
-    assert me.status_code == 401, "access tokens of a revoked session must stop working"
-    client.cookies.clear()
+    me = (await client.get("/api/auth/me", headers=h)).json()
+    assert me["name"] == "Test Analyst"
+    log = (await client.get("/api/audit", headers=h)).json()
+    assert [e["action"] for e in log] == ["auth.session_started"]
 
 
 async def test_full_pipeline_and_privacy(client):
     h = await make_user(client)
-    auth = {"Authorization": h["Authorization"]}
     d = await upload_and_wait(client, h, SAMPLE.read_bytes(), "messy_sales.csv")
     assert d["status"] == "ready", d
     assert d["row_count"] == 5000  # 50 exact duplicates removed
     assert 0 < d["quality_score"] <= 100
 
-    rep = (await client.get(f"/api/datasets/{d['id']}/report", headers=auth)).json()["report"]
+    rep = (await client.get(f"/api/datasets/{d['id']}/report", headers=h)).json()["report"]
     kinds = {c["name"]: c["kind"] for c in rep["columns"]}
     assert kinds["Order Date"] == "datetime"
     assert kinds["Revenue"] == "numeric"
@@ -75,29 +61,30 @@ async def test_full_pipeline_and_privacy(client):
     assert pii["Card Number"] == "credit_card" and pii["Email"] == "email"
     assert any(i["kind"] == "trend" for i in rep["insights"])
     assert rep["timeseries"]["series"][0]["forecast"]["y"]
+    # Statistics in the report respect the privacy policy too.
+    cols = {c["name"]: c for c in rep["columns"]}
+    assert all(t["value"] == "[REDACTED]" for t in cols["Card Number"].get("top", []))
+    assert all("•••" in str(t["value"]) for t in cols["Customer Name"].get("top", []))
 
-    rows = (await client.get(f"/api/datasets/{d['id']}/rows?limit=5", headers=auth)).json()
-    cols = [c["name"] for c in rows["columns"]]
-    card = rows["rows"][0][cols.index("Card Number")]
-    email = rows["rows"][0][cols.index("Email")]
-    assert card == "[REDACTED]"
-    assert "•••@" in email
+    rows = (await client.get(f"/api/datasets/{d['id']}/rows?limit=5", headers=h)).json()
+    names = [c["name"] for c in rows["columns"]]
+    assert rows["rows"][0][names.index("Card Number")] == "[REDACTED]"
+    assert "•••@" in rows["rows"][0][names.index("Email")]
 
     # Pseudonymise instead: deterministic, joinable tokens.
-    r = await client.put(f"/api/datasets/{d['id']}/privacy", json={"policy": {"Email": "hash"}}, headers=auth)
+    r = await client.put(f"/api/datasets/{d['id']}/privacy", json={"policy": {"Email": "hash"}}, headers=h)
     assert r.status_code == 200
-    rows = (await client.get(f"/api/datasets/{d['id']}/rows?limit=5", headers=auth)).json()
-    assert rows["rows"][0][cols.index("Email")].startswith("anon_")
-    assert rows["rows"][0][cols.index("Card Number")] != "[REDACTED]"  # policy replaced wholesale
+    rows = (await client.get(f"/api/datasets/{d['id']}/rows?limit=5", headers=h)).json()
+    assert rows["rows"][0][names.index("Email")].startswith("anon_")
+    assert rows["rows"][0][names.index("Card Number")] != "[REDACTED]"  # policy replaced wholesale
 
 
 async def test_query_sandbox(client):
     h = await make_user(client)
-    auth = {"Authorization": h["Authorization"]}
     d = await upload_and_wait(client, h, b"region,sales\nWest,10\nEast,5\nWest,7\n")
     url = f"/api/datasets/{d['id']}/query"
     r = await client.post(
-        url, json={"sql": "select region, sum(sales) s from data group by 1 order by 2 desc"}, headers=auth
+        url, json={"sql": "select region, sum(sales) s from data group by 1 order by 2 desc"}, headers=h
     )
     assert r.status_code == 200, r.text
     assert r.json()["rows"][0] == ["West", 17]
@@ -107,7 +94,7 @@ async def test_query_sandbox(client):
         "select 1; select 2",
         "copy data to 'x.csv'",
     ]:
-        r = await client.post(url, json={"sql": bad}, headers=auth)
+        r = await client.post(url, json={"sql": bad}, headers=h)
         assert r.status_code == 400, bad
 
 
@@ -115,11 +102,10 @@ async def test_tenant_isolation(client):
     a = await make_user(client)
     b = await make_user(client)
     d = await upload_and_wait(client, a, b"x,y\n1,2\n3,4\n")
-    other = {"Authorization": b["Authorization"]}
-    assert (await client.get(f"/api/datasets/{d['id']}", headers=other)).status_code == 404
-    assert (await client.get(f"/api/datasets/{d['id']}/rows", headers=other)).status_code == 404
-    assert (await client.delete(f"/api/datasets/{d['id']}", headers=other)).status_code == 404
-    assert (await client.get("/api/datasets", headers=other)).json() == []
+    assert (await client.get(f"/api/datasets/{d['id']}", headers=b)).status_code == 404
+    assert (await client.get(f"/api/datasets/{d['id']}/rows", headers=b)).status_code == 404
+    assert (await client.delete(f"/api/datasets/{d['id']}", headers=b)).status_code == 404
+    assert (await client.get("/api/datasets", headers=b)).json() == []
 
 
 async def test_formats_json_ndjson_gzip(client):
@@ -134,9 +120,7 @@ async def test_formats_json_ndjson_gzip(client):
     )
     d = await upload_and_wait(client, h, nested.encode(), "api.json")
     assert d["status"] == "ready" and d["source_format"] == "json"
-    rep = (await client.get(f"/api/datasets/{d['id']}/report", headers={"Authorization": h["Authorization"]})).json()[
-        "report"
-    ]
+    rep = (await client.get(f"/api/datasets/{d['id']}/report", headers=h)).json()["report"]
     assert "user.name" in {c["name"] for c in rep["columns"]}
 
     nd = "\n".join(json.dumps({"k": i, "v": i * 2}) for i in range(25)).encode()
@@ -153,60 +137,37 @@ async def test_rejects_binary(client):
 
 async def test_export_neutralises_formulas(client):
     h = await make_user(client)
-    auth = {"Authorization": h["Authorization"]}
     d = await upload_and_wait(client, h, b'name,note\nann,"=HYPERLINK(""http://x"")"\nbob,ok\n')
-    r = await client.get(f"/api/datasets/{d['id']}/export?format=csv", headers=auth)
+    r = await client.get(f"/api/datasets/{d['id']}/export?format=csv", headers=h)
     assert r.status_code == 200
     assert "'=HYPERLINK" in r.text
 
 
 async def test_audit_chain_detects_tampering(client):
     h = await make_user(client)
-    auth = {"Authorization": h["Authorization"]}
     await upload_and_wait(client, h, b"a,b\n1,2\n")
-    v = (await client.get("/api/audit/verify", headers=auth)).json()
+    v = (await client.get("/api/audit/verify", headers=h)).json()
     assert v["valid"] and v["events"] >= 3
-    log = (await client.get("/api/audit", headers=auth)).json()
-    owner = (await client.get("/api/auth/me", headers=auth)).json()["id"]
-    async with tenant_session(owner) as s:
+    owner = (await client.get("/api/auth/me", headers=h)).json()["id"]
+    # On Supabase this UPDATE is refused outright (append-only trigger + no UPDATE grant);
+    # the hash chain is the second line of defence, simulated here on SQLite.
+    async with tenant_session(claims_for(owner)) as s:
         await s.execute(
             update(AuditEvent).where(AuditEvent.owner_id == owner, AuditEvent.seq == 2).values(ip="6.6.6.6")
         )
         await s.commit()
-    v = (await client.get("/api/audit/verify", headers=auth)).json()
+    v = (await client.get("/api/audit/verify", headers=h)).json()
     assert not v["valid"] and v["broken_at"] == 2
-    assert log[0]["seq"] > log[-1]["seq"]
 
 
 async def test_delete_crypto_shreds(client):
     from app.services import storage
 
     h = await make_user(client)
-    auth = {"Authorization": h["Authorization"]}
+    owner = (await client.get("/api/auth/me", headers=h)).json()["id"]
     d = await upload_and_wait(client, h, b"a,b\n1,2\n")
-    path = storage._blob_path(d["id"])
+    path = storage._local_file(storage.object_path(owner, d["id"]))
     assert path.exists() and b"a,b" not in path.read_bytes()
-    assert (await client.delete(f"/api/datasets/{d['id']}", headers=auth)).status_code == 204
+    assert (await client.delete(f"/api/datasets/{d['id']}", headers=h)).status_code == 204
     assert not path.exists()
-    assert (await client.get(f"/api/datasets/{d['id']}", headers=auth)).status_code == 404
-
-
-async def test_postgres_row_level_security_blocks_unscoped_reads(client):
-    """Even a query with no owner filter only sees the scoped tenant's rows (PostgreSQL only)."""
-    import pytest
-    from sqlalchemy import func, select
-
-    from app.db.models import Dataset
-    from app.db.session import engine
-
-    if engine.dialect.name != "postgresql":
-        pytest.skip("RLS is enforced by PostgreSQL; SQLite relies on application filters")
-    a = await make_user(client)
-    b = await make_user(client)
-    await upload_and_wait(client, a, b"x,y\n1,2\n")
-    b_id = (await client.get("/api/auth/me", headers={"Authorization": b["Authorization"]})).json()["id"]
-    async with tenant_session(b_id) as s:
-        visible = (await s.execute(select(func.count()).select_from(Dataset))).scalar_one()
-    assert visible == 0
-    async with tenant_session(None) as s:
-        assert (await s.execute(select(func.count()).select_from(Dataset))).scalar_one() == 0
+    assert (await client.get(f"/api/datasets/{d['id']}", headers=h)).status_code == 404

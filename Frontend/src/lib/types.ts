@@ -8,12 +8,6 @@ export interface User {
   created_at: string;
 }
 
-export interface TokenResponse {
-  access_token: string;
-  expires_at: number;
-  user: User;
-}
-
 export interface DatasetSummary {
   id: string;
   name: string;
@@ -262,8 +256,8 @@ export interface SystemInfo {
   query_timeout_s: number;
   database: string;
   encryption: string;
-  token_signing: string;
-  password_hashing: string;
+  auth: string;
+  storage: string;
   cache: { entries: number; bytes: number; hits: number; misses: number };
   usage: { datasets: number; rows: number; stored_bytes: number; avg_quality: number | null };
 }
@@ -272,8 +266,9 @@ export interface SessionInfo {
   id: string;
   user_agent: string;
   ip: string;
-  created_at: string;
-  last_used_at: string;
+  created_at: string | null;
+  last_used_at: string | null;
+  aal: string;
   current: boolean;
 }
 

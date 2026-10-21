@@ -10,32 +10,70 @@ import type {
   RowsPage,
   SessionInfo,
   SystemInfo,
-  TokenResponse,
   User,
 } from "./types";
+import type { AuthError, Session } from "@supabase/supabase-js";
+import { supabase } from "./supabase";
 
 /**
- * The access token lives only in memory (never localStorage), so XSS cannot exfiltrate a
- * long-lived credential. The refresh token is an httpOnly, SameSite=Strict cookie scoped to
- * /api/auth; a page reload silently restores the session through /api/auth/refresh.
+ * Session state mirrors Supabase Auth. supabase-js refreshes the access token before it
+ * expires (refresh tokens rotate on every use); the store just exposes the current token and
+ * user to the rest of the app.
  */
 interface AuthState {
   status: "loading" | "authed" | "anon";
   user: User | null;
   token: string | null;
-  expiresAt: number;
-  set: (r: TokenResponse) => void;
-  clear: () => void;
+  sessionId: string | null;
+  recovering: boolean;
 }
 
-export const useAuth = create<AuthState>((set) => ({
+export const useAuth = create<AuthState>(() => ({
   status: "loading",
   user: null,
   token: null,
-  expiresAt: 0,
-  set: (r) => set({ status: "authed", user: r.user, token: r.access_token, expiresAt: r.expires_at }),
-  clear: () => set({ status: "anon", user: null, token: null, expiresAt: 0 }),
+  sessionId: null,
+  recovering: false,
 }));
+
+function sessionIdOf(token: string): string | null {
+  try {
+    return JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).session_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function apply(session: Session | null) {
+  if (!session) {
+    useAuth.setState({ status: "anon", user: null, token: null, sessionId: null });
+    return;
+  }
+  const u = session.user;
+  const name = (u.user_metadata?.name as string | undefined) || u.email?.split("@")[0] || "Analyst";
+  useAuth.setState({
+    status: "authed",
+    token: session.access_token,
+    sessionId: sessionIdOf(session.access_token),
+    user: { id: u.id, email: u.email ?? "", name, created_at: u.created_at },
+  });
+}
+
+/** Restore the persisted session and keep the store in sync with Supabase Auth. */
+export function initAuth(): () => void {
+  void supabase.auth.getSession().then(({ data }) => apply(data.session));
+  const { data } = supabase.auth.onAuthStateChange((event, session) => {
+    if (event === "PASSWORD_RECOVERY") useAuth.setState({ recovering: true });
+    apply(session);
+  });
+  return () => data.subscription.unsubscribe();
+}
+
+export async function refreshSession(): Promise<boolean> {
+  const { data, error } = await supabase.auth.refreshSession();
+  apply(error ? null : data.session);
+  return !error && !!data.session;
+}
 
 export class ApiError extends Error {
   status: number;
@@ -45,39 +83,8 @@ export class ApiError extends Error {
   }
 }
 
-let refreshing: Promise<boolean> | null = null;
-let refreshTimer: ReturnType<typeof setTimeout> | undefined;
-
-function scheduleRefresh(expiresAt: number) {
-  clearTimeout(refreshTimer);
-  const ms = Math.max(5_000, expiresAt * 1000 - Date.now() - 60_000);
-  refreshTimer = setTimeout(() => void refreshSession(), ms);
-}
-
-export function refreshSession(): Promise<boolean> {
-  refreshing ??= (async () => {
-    try {
-      const res = await fetch("/api/auth/refresh", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "X-SAP-CSRF": "1" },
-      });
-      if (!res.ok) {
-        useAuth.getState().clear();
-        return false;
-      }
-      const data = (await res.json()) as TokenResponse;
-      useAuth.getState().set(data);
-      scheduleRefresh(data.expires_at);
-      return true;
-    } catch {
-      useAuth.getState().clear();
-      return false;
-    } finally {
-      refreshing = null;
-    }
-  })();
-  return refreshing;
+function authError(e: AuthError): ApiError {
+  return new ApiError(e.status ?? 400, e.message);
 }
 
 async function errorFrom(res: Response): Promise<ApiError> {
@@ -98,7 +105,7 @@ export async function request(path: string, init: RequestInit = {}, retry = true
   if (init.body && !(init.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const res = await fetch(path, { ...init, headers, credentials: "same-origin" });
+  const res = await fetch(path, { ...init, headers });
   if (res.status === 401 && retry && token) {
     if (await refreshSession()) return request(path, init, false);
   }
@@ -111,27 +118,35 @@ async function json<T>(path: string, init?: RequestInit): Promise<T> {
   return res.status === 204 ? (undefined as T) : ((await res.json()) as T);
 }
 
-async function authenticate(path: string, body: object): Promise<void> {
-  const res = await fetch(path, {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw await errorFrom(res);
-  const data = (await res.json()) as TokenResponse;
-  useAuth.getState().set(data);
-  scheduleRefresh(data.expires_at);
-}
-
 export const api = {
-  login: (email: string, password: string) => authenticate("/api/auth/login", { email, password }),
-  register: (name: string, email: string, password: string) =>
-    authenticate("/api/auth/register", { name, email, password }),
-  logout: async () => {
-    clearTimeout(refreshTimer);
-    await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin", headers: { "X-SAP-CSRF": "1" } });
-    useAuth.getState().clear();
+  login: async (email: string, password: string) => {
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) throw authError(error);
+    apply(data.session);
+  },
+  /** Returns true when the account still needs its email confirmed. */
+  register: async (name: string, email: string, password: string): Promise<boolean> => {
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: { data: { name }, emailRedirectTo: `${window.location.origin}/app` },
+    });
+    if (error) throw authError(error);
+    apply(data.session);
+    return !data.session;
+  },
+  resetPassword: async (email: string) => {
+    const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: `${window.location.origin}/reset-password` });
+    if (error) throw authError(error);
+  },
+  updatePassword: async (password: string) => {
+    const { error } = await supabase.auth.updateUser({ password });
+    if (error) throw authError(error);
+    useAuth.setState({ recovering: false });
+  },
+  logout: async (scope: "local" | "global" = "local") => {
+    await supabase.auth.signOut({ scope });
+    apply(null);
   },
   sessions: () => json<SessionInfo[]>("/api/auth/sessions"),
   revokeSession: (id: string) => json<void>(`/api/auth/sessions/${id}`, { method: "DELETE" }),

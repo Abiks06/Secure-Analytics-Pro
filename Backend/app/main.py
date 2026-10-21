@@ -47,10 +47,10 @@ app.add_middleware(
     allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Authorization", "Content-Type", "X-SAP-CSRF"],
+    allow_headers=["Authorization", "Content-Type"],
     max_age=600,
 )
-app.add_middleware(SecurityHeadersMiddleware, hsts=settings.is_prod)
+app.add_middleware(SecurityHeadersMiddleware, hsts=settings.is_prod, connect_src=settings.supabase_url or "")
 
 
 @app.exception_handler(RequestValidationError)

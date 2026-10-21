@@ -199,11 +199,11 @@ const FEATURES = [
 
 const SECURITY = [
   { icon: <KeyRound className="size-4" />, title: "Envelope encryption", body: "A unique AES-256-GCM key per dataset, wrapped by a master key. Deleting the key crypto-shreds the data." },
-  { icon: <Shield className="size-4" />, title: "Argon2id + EdDSA", body: "Memory-hard password hashing. Ed25519-signed 15-minute access tokens held in memory only." },
+  { icon: <Shield className="size-4" />, title: "Supabase Auth", body: "Email-verified accounts. Short-lived ES256 access tokens, checked against public keys and live session state on every request." },
   { icon: <Link2 className="size-4" />, title: "Tamper-evident audit", body: "Every action is hash-chained. Edit one log row and verification pinpoints where the chain broke." },
-  { icon: <Binary className="size-4" />, title: "Row Level Security", body: "Postgres RLS is forced on every tenant table. Even a query bug cannot read another user's rows." },
+  { icon: <Binary className="size-4" />, title: "Row Level Security", body: "Forced RLS on every table, enforced on a least-privilege engine role. Even a query bug cannot read another user's rows." },
   { icon: <FileWarning className="size-4" />, title: "Hostile-file hardened", body: "Magic-byte sniffing, decompression-bomb limits, and CSV formula-injection neutralised on export." },
-  { icon: <Lock className="size-4" />, title: "Refresh-token reuse detection", body: "Rotating httpOnly refresh tokens. A replayed token revokes the whole session instantly." },
+  { icon: <Lock className="size-4" />, title: "Instant session revocation", body: "Refresh tokens rotate on every use and replays are rejected. Revoke any device and its access stops on the next request." },
 ];
 
 function ChainVisual() {
@@ -304,7 +304,7 @@ export default function Landing() {
             </a>
           </motion.div>
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.5, duration: 1 }} className="mt-10 flex flex-wrap gap-x-6 gap-y-2 font-mono text-[12px] text-fg-subtle">
-            {["AES-256-GCM", "Argon2id", "Ed25519 JWT", "Postgres RLS", "SHA-256 audit chain"].map((t) => (
+            {["AES-256-GCM", "Supabase Auth", "ES256 JWT", "Postgres RLS", "SHA-256 audit chain"].map((t) => (
               <span key={t} className="flex items-center gap-1.5">
                 <Check className="size-3 text-mint" /> {t}
               </span>

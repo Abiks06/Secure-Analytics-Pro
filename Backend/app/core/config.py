@@ -9,8 +9,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
@@ -21,19 +19,23 @@ class Settings(BaseSettings):
     env: Literal["dev", "prod", "test"] = "dev"
     app_name: str = "Secure Analytics Pro"
 
+    # Supabase Postgres via the session pooler, as the least-privilege `sap_engine` role.
+    # SQLite is supported for offline tests only.
     database_url: str = "sqlite+aiosqlite:///./data/app.db"
     data_dir: Path = Path("./data")
 
+    # Supabase project. Auth tokens are verified against its public JWKS; encrypted datasets
+    # are stored in its private `datasets` bucket using the caller's own access token.
+    supabase_url: str | None = None
+    supabase_publishable_key: str | None = None
+    # Test-only: a JWKS document to trust instead of fetching it from Supabase.
+    supabase_jwks_json: str | None = None
+    storage_backend: Literal["supabase", "local"] | None = None
+
     # 32-byte key-encryption key (base64). Wraps the per-dataset data keys.
     master_key: str | None = None
-    # PEM-encoded Ed25519 private key used to sign access tokens.
-    jwt_private_key: str | None = None
-    jwt_issuer: str = "secure-analytics-pro"
-    access_token_ttl_s: int = 15 * 60
-    refresh_token_ttl_s: int = 14 * 24 * 3600
 
     cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=lambda: ["http://localhost:5173"])
-    cookie_secure: bool = False
 
     max_upload_mb: int = 200
     max_decompressed_mb: int = 1024
@@ -55,6 +57,11 @@ class Settings(BaseSettings):
             return [o.strip() for o in v.split(",") if o.strip()]
         return v
 
+    @field_validator("supabase_url")
+    @classmethod
+    def _strip_slash(cls, v: str | None) -> str | None:
+        return v.rstrip("/") if v else v
+
     @property
     def is_prod(self) -> bool:
         return self.env == "prod"
@@ -63,59 +70,45 @@ class Settings(BaseSettings):
     def is_postgres(self) -> bool:
         return self.database_url.startswith("postgresql")
 
+    @property
+    def blob_backend(self) -> str:
+        return self.storage_backend or ("supabase" if self.supabase_url else "local")
 
-def _load_or_create(path: Path, factory) -> bytes:
-    if path.exists():
-        return path.read_bytes()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = factory()
-    path.write_bytes(data)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-    return data
+    @property
+    def jwt_issuer(self) -> str:
+        return f"{self.supabase_url}/auth/v1"
 
 
 class Keys:
-    """Key material. In production keys must come from the environment; in dev they are
+    """Key material. In production the KEK must come from the environment; in dev it is
     generated once and persisted under ``data_dir/keys`` so restarts keep data readable."""
 
     def __init__(self, settings: Settings) -> None:
-        key_dir = settings.data_dir / "keys"
         if settings.master_key:
             kek = base64.b64decode(settings.master_key)
         elif settings.is_prod:
             raise RuntimeError("SAP_MASTER_KEY is required in production")
         else:
-            kek = base64.b64decode(
-                _load_or_create(key_dir / "master.key", lambda: base64.b64encode(secrets.token_bytes(32)))
-            )
+            path = settings.data_dir / "keys" / "master.key"
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(base64.b64encode(secrets.token_bytes(32)))
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+            kek = base64.b64decode(path.read_bytes())
         if len(kek) != 32:
             raise RuntimeError("SAP_MASTER_KEY must decode to exactly 32 bytes")
         self.kek = kek
-
-        if settings.jwt_private_key:
-            pem = settings.jwt_private_key.replace("\\n", "\n").encode()
-        elif settings.is_prod:
-            raise RuntimeError("SAP_JWT_PRIVATE_KEY is required in production")
-        else:
-            pem = _load_or_create(
-                key_dir / "jwt_ed25519.pem",
-                lambda: Ed25519PrivateKey.generate().private_bytes(
-                    serialization.Encoding.PEM,
-                    serialization.PrivateFormat.PKCS8,
-                    serialization.NoEncryption(),
-                ),
-            )
-        self.jwt_private = serialization.load_pem_private_key(pem, password=None)
-        self.jwt_public = self.jwt_private.public_key()
 
 
 @lru_cache
 def get_settings() -> Settings:
     s = Settings()
     s.data_dir.mkdir(parents=True, exist_ok=True)
+    if not s.supabase_url:
+        raise RuntimeError("SAP_SUPABASE_URL is required: authentication is provided by Supabase Auth")
     return s
 
 

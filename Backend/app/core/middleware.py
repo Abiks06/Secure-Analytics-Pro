@@ -10,14 +10,16 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 _API_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
 _APP_CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-    "font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'; "
+    "font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' {connect}; "
     "frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
 )
 
 
 class SecurityHeadersMiddleware:
-    def __init__(self, app: ASGIApp, hsts: bool = False) -> None:
+    def __init__(self, app: ASGIApp, hsts: bool = False, connect_src: str = "") -> None:
         self.app = app
+        # The SPA talks to Supabase Auth directly, so its origin must be an allowed connect-src.
+        self.app_csp = _APP_CSP.format(connect=connect_src).replace("'self' ;", "'self';")
         self.hsts = hsts
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -42,7 +44,7 @@ class SecurityHeadersMiddleware:
                     b"permissions-policy": b"camera=(), microphone=(), geolocation=(), payment=()",
                     b"cross-origin-opener-policy": b"same-origin",
                     b"cross-origin-resource-policy": b"same-origin",
-                    b"content-security-policy": (_API_CSP if is_api else _APP_CSP).encode(),
+                    b"content-security-policy": (_API_CSP if is_api else self.app_csp).encode(),
                 }
                 if is_api:
                     extra[b"cache-control"] = b"no-store"

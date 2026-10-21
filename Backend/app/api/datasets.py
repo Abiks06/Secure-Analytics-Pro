@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Upl
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.orm import undefer
 from sse_starlette.sse import EventSourceResponse
 
 from app.api.deps import Principal, client_ip, current
@@ -28,8 +29,7 @@ router = APIRouter(prefix="/api/datasets", tags=["datasets"])
 
 
 def summary(ds: Dataset) -> dict[str, Any]:
-    report = ds.report or {}
-    top = [{k: i[k] for k in ("title", "kind", "severity")} for i in report.get("insights", [])[:3]]
+    h = ds.highlights or {}
     return {
         "id": ds.id,
         "name": ds.name,
@@ -45,9 +45,9 @@ def summary(ds: Dataset) -> dict[str, Any]:
         "column_count": ds.column_count,
         "quality_score": ds.quality_score,
         "processing_ms": ds.processing_ms,
-        "insight_count": len(report.get("insights", [])),
-        "pii_count": len(report.get("privacy", {}).get("findings", [])),
-        "top_insights": top,
+        "insight_count": h.get("insight_count", 0),
+        "pii_count": h.get("pii_count", 0),
+        "top_insights": h.get("top_insights", []),
         "privacy_policy": ds.privacy_policy or {},
         "created_at": ds.created_at,
         "updated_at": ds.updated_at,
@@ -55,9 +55,12 @@ def summary(ds: Dataset) -> dict[str, Any]:
 
 
 async def _get(p: Principal, dataset_id: str, *, ready: bool = False) -> Dataset:
-    ds = (
-        await p.db.execute(select(Dataset).where(Dataset.id == dataset_id, Dataset.owner_id == p.user.id))
-    ).scalar_one_or_none()
+    """Fetch one of the caller's datasets. ``ready=True`` also loads the deferred report and
+    wrapped key, which every analysis endpoint needs and list views never do."""
+    q = select(Dataset).where(Dataset.id == dataset_id, Dataset.owner_id == p.user_id)
+    if ready:
+        q = q.options(undefer(Dataset.report), undefer(Dataset.wrapped_key))
+    ds = (await p.db.execute(q)).scalar_one_or_none()
     if ds is None:
         raise HTTPException(404, detail="Dataset not found")
     if ready and ds.status != "ready":
@@ -69,14 +72,14 @@ def _policy_key(policy: dict[str, str]) -> str:
     return hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def visible_frame(ds: Dataset) -> pl.DataFrame:
+def visible_frame(ds: Dataset, token: str) -> pl.DataFrame:
     """The dataset as the owner may see it: privacy policy applied, cached per policy version."""
     policy = ds.privacy_policy or {}
     key = f"{ds.id}:{_policy_key(policy)}"
     hit = storage.cache.get(key)
     if hit is not None:
         return hit
-    frame = storage.load_frame(ds.id, ds.wrapped_key)
+    frame = storage.load_frame(ds.id, ds.wrapped_key, ds.storage_path or "", token)
     if policy:
         findings = (ds.report or {}).get("privacy", {}).get("findings", [])
         frame = pii.apply_policy(frame, policy, findings, pseudonym_key(storage.data_key(ds.id, ds.wrapped_key)))
@@ -84,8 +87,47 @@ def visible_frame(ds: Dataset) -> pl.DataFrame:
     return frame
 
 
-async def _visible(ds: Dataset) -> pl.DataFrame:
-    return await anyio.to_thread.run_sync(visible_frame, ds)
+async def _visible(ds: Dataset, token: str) -> pl.DataFrame:
+    try:
+        return await anyio.to_thread.run_sync(visible_frame, ds, token)
+    except storage.StorageError as e:
+        raise HTTPException(502, detail="Encrypted dataset could not be fetched from storage.") from e
+
+
+def scrubbed_report(ds: Dataset) -> dict[str, Any]:
+    """The stored report with the privacy policy applied to any raw values it quotes (column top
+    values, category labels in insight charts and text), so protected data never leaks via stats."""
+    report = ds.report or {}
+    policy = {c: m for c, m in (ds.privacy_policy or {}).items() if m != "none"}
+    if not policy:
+        return report
+    report = json.loads(json.dumps(report))
+    findings = report.get("privacy", {}).get("findings", [])
+    key = pseudonym_key(storage.data_key(ds.id, ds.wrapped_key))
+    replacements: dict[str, str] = {}
+    for col in report.get("columns", []):
+        mode = policy.get(col["name"])
+        if not mode or not col.get("top"):
+            continue
+        raw = [str(t["value"]) for t in col["top"]]
+        masked = pii.apply_policy(pl.DataFrame({col["name"]: raw}), {col["name"]: mode}, findings, key)[
+            col["name"]
+        ].to_list()
+        for t, m in zip(col["top"], masked, strict=True):
+            replacements[str(t["value"])] = m
+            t["value"] = m
+        col.pop("length", None)
+    for ins in report.get("insights", []):
+        if not set(ins.get("columns", [])) & set(policy):
+            continue
+        for raw, m in replacements.items():
+            if len(raw) >= 2:
+                ins["title"] = ins["title"].replace(f"'{raw}'", f"'{m}'")
+                ins["body"] = ins["body"].replace(f"'{raw}'", f"'{m}'")
+        chart = ins.get("chart") or {}
+        if chart.get("type") == "bar" and chart.get("x") in policy:
+            chart["categories"] = [replacements.get(str(c), "[protected]") for c in chart.get("categories", [])]
+    return report
 
 
 @router.post("", status_code=202)
@@ -109,26 +151,26 @@ async def upload(
         re.sub(r"[^\w .()\-]+", "_", (file.filename or "dataset").rsplit("/", 1)[-1].rsplit("\\", 1)[-1])[:200]
         or "dataset"
     )
-    ds = Dataset(owner_id=p.user.id, name=name, size_bytes=len(buf), sha256=digest.hexdigest())
+    ds = Dataset(owner_id=p.user_id, name=name, size_bytes=len(buf), sha256=digest.hexdigest())
     p.db.add(ds)
     await p.db.flush()
     await audit.record(
         p.db,
-        p.user.id,
+        p.user_id,
         "dataset.upload",
         target=ds.id,
         ip=client_ip(request),
         detail={"name": name, "bytes": len(buf), "sha256": ds.sha256},
     )
     await p.db.commit()
-    jobs.submit(ds.id, p.user.id, bytes(buf), client_ip(request))
+    jobs.submit(ds.id, p.user_id, bytes(buf), client_ip(request), p.token)
     return summary(ds)
 
 
 @router.get("")
 async def list_datasets(p: Principal = Depends(current)) -> list[dict[str, Any]]:
     rows = (
-        (await p.db.execute(select(Dataset).where(Dataset.owner_id == p.user.id).order_by(Dataset.created_at.desc())))
+        (await p.db.execute(select(Dataset).where(Dataset.owner_id == p.user_id).order_by(Dataset.created_at.desc())))
         .scalars()
         .all()
     )
@@ -143,7 +185,8 @@ async def get_dataset(dataset_id: str, p: Principal = Depends(current)) -> dict[
 @router.get("/{dataset_id}/report")
 async def get_report(dataset_id: str, p: Principal = Depends(current)) -> dict[str, Any]:
     ds = await _get(p, dataset_id, ready=True)
-    return {"dataset": summary(ds), "report": ds.report}
+    report = await anyio.to_thread.run_sync(scrubbed_report, ds)
+    return {"dataset": summary(ds), "report": report}
 
 
 @router.get("/{dataset_id}/events")
@@ -187,7 +230,7 @@ async def rows(
     q: str | None = Query(None, max_length=200),
 ) -> dict[str, Any]:
     ds = await _get(p, dataset_id, ready=True)
-    frame = await _visible(ds)
+    frame = await _visible(ds, p.token)
 
     def page() -> dict[str, Any]:
         df = frame.with_row_index("__row")
@@ -228,7 +271,7 @@ async def run_query(
     _rl: None = Depends(ratelimit.limit(ratelimit.QUERY)),
 ) -> dict[str, Any]:
     ds = await _get(p, dataset_id, ready=True)
-    frame = await _visible(ds)
+    frame = await _visible(ds, p.token)
     s = get_settings()
     try:
         result = await anyio.to_thread.run_sync(
@@ -238,7 +281,7 @@ async def run_query(
         raise HTTPException(400, detail=str(e)) from e
     await audit.record(
         p.db,
-        p.user.id,
+        p.user_id,
         "dataset.query",
         target=ds.id,
         ip=client_ip(request),
@@ -261,14 +304,14 @@ async def ask(
     _rl: None = Depends(ratelimit.limit(ratelimit.AI)),
 ) -> dict[str, Any]:
     ds = await _get(p, dataset_id, ready=True)
-    frame = await _visible(ds)
+    frame = await _visible(ds, p.token)
     try:
         result = await ai.ask(body.question, frame, ds.report or {}, ds.privacy_policy or {})
     except ai.AIUnavailable as e:
         raise HTTPException(503, detail=str(e)) from e
     await audit.record(
         p.db,
-        p.user.id,
+        p.user_id,
         "dataset.ask",
         target=ds.id,
         ip=client_ip(request),
@@ -319,7 +362,7 @@ async def set_privacy(
         if before.get(c, "none") != after.get(c, "none")
     }
     await audit.record(
-        p.db, p.user.id, "privacy.update", target=ds.id, ip=client_ip(request), detail={"changes": changes}
+        p.db, p.user_id, "privacy.update", target=ds.id, ip=client_ip(request), detail={"changes": changes}
     )
     await p.db.commit()
     return summary(ds)
@@ -336,7 +379,7 @@ async def export(
     format: Literal["csv", "parquet", "json"] = "csv",
 ) -> StreamingResponse:
     ds = await _get(p, dataset_id, ready=True)
-    frame = await _visible(ds)
+    frame = await _visible(ds, p.token)
 
     def render() -> bytes:
         buf = io.BytesIO()
@@ -362,7 +405,7 @@ async def export(
     data = await anyio.to_thread.run_sync(render)
     await audit.record(
         p.db,
-        p.user.id,
+        p.user_id,
         "dataset.export",
         target=ds.id,
         ip=client_ip(request),
@@ -383,11 +426,13 @@ async def delete(dataset_id: str, request: Request, p: Principal = Depends(curre
     ds = await _get(p, dataset_id)
     if ds.status in ("queued", "processing"):
         raise HTTPException(409, detail="Wait for processing to finish before deleting.")
-    await anyio.to_thread.run_sync(storage.shred, ds.id)
-    storage.cache.drop(f"{ds.id}:{_policy_key(ds.privacy_policy or {})}")
+    try:
+        await anyio.to_thread.run_sync(storage.shred, ds.id, ds.storage_path, p.token)
+    except storage.StorageError as e:
+        raise HTTPException(502, detail="Could not delete the encrypted file from storage; nothing was removed.") from e
     await audit.record(
         p.db,
-        p.user.id,
+        p.user_id,
         "dataset.delete",
         target=ds.id,
         ip=client_ip(request),

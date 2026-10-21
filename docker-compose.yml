@@ -1,38 +1,23 @@
-# Production-like stack: the app plus PostgreSQL with Row Level Security enforced.
+# Runs the analytics engine + web app as one container against your Supabase project.
 #
-#   cp .env.example .env    # then fill in the secrets (see README)
+#   cp .env.example .env    # fill in the values (see README)
 #   docker compose up --build
 #
-# The app connects as `sap_app`, a non-superuser that does not own bypass rights,
-# so the RLS policies created at startup genuinely constrain every query.
+# Database, auth and encrypted file storage are all provided by Supabase.
 
 services:
-  db:
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_DB: sap
-      POSTGRES_USER: sap_admin
-      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?set POSTGRES_ADMIN_PASSWORD in .env}
-      SAP_APP_PASSWORD: ${SAP_DB_PASSWORD:?set SAP_DB_PASSWORD in .env}
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./deploy/postgres-init.sh:/docker-entrypoint-initdb.d/10-app-role.sh:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sap_admin -d sap"]
-      interval: 5s
-      retries: 10
-
   app:
-    build: .
-    depends_on:
-      db:
-        condition: service_healthy
+    build:
+      context: .
+      args:
+        VITE_SUPABASE_URL: ${SAP_SUPABASE_URL:?set SAP_SUPABASE_URL in .env}
+        VITE_SUPABASE_PUBLISHABLE_KEY: ${SAP_SUPABASE_PUBLISHABLE_KEY:?set SAP_SUPABASE_PUBLISHABLE_KEY in .env}
     environment:
-      SAP_DATABASE_URL: postgresql+asyncpg://sap_app:${SAP_DB_PASSWORD}@db:5432/sap
+      SAP_DATABASE_URL: ${SAP_DATABASE_URL:?set SAP_DATABASE_URL in .env}
+      SAP_SUPABASE_URL: ${SAP_SUPABASE_URL}
+      SAP_SUPABASE_PUBLISHABLE_KEY: ${SAP_SUPABASE_PUBLISHABLE_KEY}
       SAP_MASTER_KEY: ${SAP_MASTER_KEY:?set SAP_MASTER_KEY in .env}
-      SAP_JWT_PRIVATE_KEY: ${SAP_JWT_PRIVATE_KEY:?set SAP_JWT_PRIVATE_KEY in .env}
       SAP_CORS_ORIGINS: ${SAP_PUBLIC_ORIGIN:-http://localhost:8000}
-      SAP_COOKIE_SECURE: ${SAP_COOKIE_SECURE:-false}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     ports:
       - "8000:8000"
@@ -40,5 +25,4 @@ services:
       - appdata:/data
 
 volumes:
-  pgdata:
   appdata:

@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, type ReactNode } from "react";
 import { createBrowserRouter, Navigate, RouterProvider, useLocation } from "react-router";
 import { LogoMark } from "./components/Brand";
-import { refreshSession, useAuth } from "./lib/api";
+import { initAuth, useAuth } from "./lib/api";
 
 const Landing = lazy(() => import("./pages/Landing"));
 const AuthPage = lazy(() => import("./pages/Auth"));
@@ -33,8 +33,9 @@ function RequireAuth({ children }: { children: ReactNode }) {
 
 function GuestOnly({ children }: { children: ReactNode }) {
   const status = useAuth((s) => s.status);
+  const recovering = useAuth((s) => s.recovering);
   if (status === "loading") return <Splash />;
-  if (status === "authed") return <Navigate to="/app" replace />;
+  if (status === "authed" && !recovering) return <Navigate to="/app" replace />;
   return <>{children}</>;
 }
 
@@ -44,6 +45,8 @@ const router = createBrowserRouter([
   { path: "/", element: s(<Landing />) },
   { path: "/login", element: s(<GuestOnly><AuthPage mode="login" /></GuestOnly>) },
   { path: "/register", element: s(<GuestOnly><AuthPage mode="register" /></GuestOnly>) },
+  { path: "/forgot-password", element: s(<GuestOnly><AuthPage mode="forgot" /></GuestOnly>) },
+  { path: "/reset-password", element: s(<AuthPage mode="reset" />) },
   {
     path: "/app",
     element: s(<RequireAuth><AppShell /></RequireAuth>),
@@ -57,9 +60,6 @@ const router = createBrowserRouter([
 ]);
 
 export default function App() {
-  useEffect(() => {
-    // Restore the session from the httpOnly refresh cookie, if there is one.
-    void refreshSession();
-  }, []);
+  useEffect(() => initAuth(), []);
   return <RouterProvider router={router} />;
 }

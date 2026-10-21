@@ -16,11 +16,11 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import anyio
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 
 from app.core.config import get_settings
 from app.db.models import Dataset
-from app.db.session import tenant_session
+from app.db.session import claims_for, is_postgres, tenant_session
 from app.engine import pipeline
 from app.engine.ingest import IngestError
 from app.services import audit, storage
@@ -73,44 +73,32 @@ def _sem() -> asyncio.Semaphore:
     return _semaphore
 
 
-def submit(dataset_id: str, owner_id: str, data: bytes, ip: str) -> None:
+def submit(dataset_id: str, owner_id: str, data: bytes, ip: str, token: str) -> None:
+    """Queue processing. ``token`` is the uploader's access token, used only to write the
+    encrypted result to their Storage folder (processing takes seconds; tokens last an hour)."""
     hub.publish(dataset_id, {"status": "queued", "stage": "queued", "progress": 0.0, "message": "Waiting for a worker"})
-    task = asyncio.create_task(_process(dataset_id, owner_id, data, ip))
+    task = asyncio.create_task(_process(dataset_id, owner_id, data, ip, token))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
 
 
 async def _set(owner_id: str, dataset_id: str, **values: Any) -> None:
-    async with tenant_session(owner_id) as s:
+    async with tenant_session(claims_for(owner_id)) as s:
         await s.execute(update(Dataset).where(Dataset.id == dataset_id, Dataset.owner_id == owner_id).values(**values))
         await s.commit()
 
 
-async def _set_stage(owner_id: str, dataset_id: str, stage: str, progress: float) -> None:
-    # Stage writes are fire-and-forget from the worker thread and may land late, so they must
-    # never move a dataset out of a terminal state.
-    async with tenant_session(owner_id) as s:
-        await s.execute(
-            update(Dataset)
-            .where(Dataset.id == dataset_id, Dataset.owner_id == owner_id, Dataset.status == "processing")
-            .values(stage=stage, progress=progress)
-        )
-        await s.commit()
-
-
-async def _process(dataset_id: str, owner_id: str, data: bytes, ip: str) -> None:
+async def _process(dataset_id: str, owner_id: str, data: bytes, ip: str, token: str) -> None:
     loop = asyncio.get_running_loop()
     settings = get_settings()
     async with _sem():
         started = time.perf_counter()
-        last_stage = {"name": ""}
 
         def progress(stage: str, frac: float, message: str | None) -> None:
+            # Live progress goes to subscribers over SSE only; the database is written at the
+            # start and end of a job, keeping round trips to the managed database to a minimum.
             event = {"status": "processing", "stage": stage, "progress": round(frac, 3), "message": message}
             loop.call_soon_threadsafe(hub.publish, dataset_id, event)
-            if stage != last_stage["name"]:
-                last_stage["name"] = stage
-                asyncio.run_coroutine_threadsafe(_set_stage(owner_id, dataset_id, stage, frac), loop)
 
         try:
             await _set(owner_id, dataset_id, status="processing", stage="validate", progress=0.0)
@@ -128,14 +116,19 @@ async def _process(dataset_id: str, owner_id: str, data: bytes, ip: str) -> None
                     "message": "AES-256-GCM, per-dataset key",
                 },
             )
-            wrapped, stored = await anyio.to_thread.run_sync(storage.save_frame, dataset_id, out.frame)
+            t_secure = time.perf_counter()
+            wrapped, stored, path = await anyio.to_thread.run_sync(
+                storage.save_frame, owner_id, dataset_id, out.frame, token
+            )
+            out.report["timings_ms"]["secure"] = round((time.perf_counter() - t_secure) * 1000, 1)
             elapsed = int((time.perf_counter() - started) * 1000)
             out.report["timings_ms"]["total"] = elapsed
-            async with tenant_session(owner_id) as s:
+            async with tenant_session(claims_for(owner_id)) as s:
                 await s.execute(
                     update(Dataset)
                     .where(Dataset.id == dataset_id, Dataset.owner_id == owner_id)
                     .values(
+                        storage_path=path,
                         status="ready",
                         stage="ready",
                         progress=1.0,
@@ -147,6 +140,13 @@ async def _process(dataset_id: str, owner_id: str, data: bytes, ip: str) -> None
                         stored_bytes=stored,
                         wrapped_key=wrapped,
                         report=out.report,
+                        highlights={
+                            "insight_count": len(out.report["insights"]),
+                            "pii_count": len(out.report["privacy"]["findings"]),
+                            "top_insights": [
+                                {k: i[k] for k in ("title", "kind", "severity")} for i in out.report["insights"][:3]
+                            ],
+                        },
                         privacy_policy=out.policy,
                         processing_ms=elapsed,
                     )
@@ -177,7 +177,7 @@ async def _process(dataset_id: str, owner_id: str, data: bytes, ip: str) -> None
 
 
 async def _fail(owner_id: str, dataset_id: str, message: str, ip: str) -> None:
-    async with tenant_session(owner_id) as s:
+    async with tenant_session(claims_for(owner_id)) as s:
         await s.execute(
             update(Dataset)
             .where(Dataset.id == dataset_id, Dataset.owner_id == owner_id)
@@ -190,10 +190,21 @@ async def _fail(owner_id: str, dataset_id: str, message: str, ip: str) -> None:
 
 async def recover_interrupted() -> None:
     """Raw uploads are memory-only, so jobs cut off by a restart cannot resume; mark them failed."""
-    async with tenant_session(system=True) as s:
-        rows = (await s.execute(select(Dataset).where(Dataset.status.in_(["queued", "processing"])))).scalars().all()
-        for ds in rows:
-            ds.status, ds.stage, ds.error = "failed", "failed", "Interrupted by a server restart. Please upload again."
+    async with tenant_session(None) as s:
+        if is_postgres:
+            # RLS hides every row from an unscoped session; this one cross-tenant chore goes
+            # through a SECURITY DEFINER function that only sap_engine may execute.
+            await s.execute(text("select sap.fail_interrupted_jobs()"))
+        else:
+            rows = (
+                (await s.execute(select(Dataset).where(Dataset.status.in_(["queued", "processing"])))).scalars().all()
+            )
+            for ds in rows:
+                ds.status, ds.stage, ds.error = (
+                    "failed",
+                    "failed",
+                    "Interrupted by a server restart. Please upload again.",
+                )
         await s.commit()
 
 

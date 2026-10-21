@@ -7,6 +7,10 @@ WORKDIR /web
 COPY Frontend/package.json Frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY Frontend/ ./
+# Public values baked into the SPA bundle (the publishable key is designed to be public).
+ARG VITE_SUPABASE_URL
+ARG VITE_SUPABASE_PUBLISHABLE_KEY
+ENV VITE_SUPABASE_URL=$VITE_SUPABASE_URL VITE_SUPABASE_PUBLISHABLE_KEY=$VITE_SUPABASE_PUBLISHABLE_KEY
 RUN npm run build
 
 FROM python:3.13-slim AS api

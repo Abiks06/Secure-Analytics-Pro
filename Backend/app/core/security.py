@@ -1,100 +1,71 @@
-"""Password hashing (Argon2id) and token handling (EdDSA access JWTs, opaque refresh tokens)."""
+"""Verification of Supabase Auth access tokens.
+
+The project signs tokens with an asymmetric key (ES256), so the engine verifies them with the
+public JWKS and never holds a signing secret. Beyond the signature we pin the algorithm,
+issuer and audience, require the claims we rely on, and refuse anonymous sessions.
+"""
 
 from __future__ import annotations
 
-import hashlib
-import secrets
-import time
-import uuid
+import json
+from functools import lru_cache
 
 import jwt
-from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHashError, VerificationError
 
-from app.core.config import get_keys, get_settings
+from app.core.config import get_settings
 
-_hasher = PasswordHasher(time_cost=3, memory_cost=64 * 1024, parallelism=2)
-# Verified against when the account does not exist, so response timing does not reveal
-# which emails are registered.
-_DUMMY_HASH = _hasher.hash(secrets.token_urlsafe(16))
+ALGORITHMS = ["ES256", "RS256"]
 
 
-def hash_password(password: str) -> str:
-    return _hasher.hash(password)
+class TokenError(Exception):
+    pass
 
 
-def verify_password(stored_hash: str | None, password: str) -> bool:
+@lru_cache
+def _jwk_client() -> jwt.PyJWKClient | None:
+    s = get_settings()
+    if s.supabase_jwks_json:
+        return None
+    return jwt.PyJWKClient(f"{s.jwt_issuer}/.well-known/jwks.json", cache_keys=True, lifespan=600, timeout=10)
+
+
+@lru_cache
+def _static_jwks() -> jwt.PyJWKSet | None:
+    raw = get_settings().supabase_jwks_json
+    return jwt.PyJWKSet.from_dict(json.loads(raw)) if raw else None
+
+
+def _signing_key(token: str):
+    static = _static_jwks()
+    if static is not None:
+        kid = jwt.get_unverified_header(token).get("kid")
+        for key in static.keys:
+            if key.key_id == kid:
+                return key.key
+        raise TokenError("Unknown signing key")
     try:
-        return _hasher.verify(stored_hash or _DUMMY_HASH, password) and stored_hash is not None
-    except (VerificationError, InvalidHashError):
-        return False
+        return _jwk_client().get_signing_key_from_jwt(token).key  # type: ignore[union-attr]
+    except jwt.PyJWKClientError as e:
+        raise TokenError("Could not resolve the token's signing key") from e
 
 
-def needs_rehash(stored_hash: str) -> bool:
-    return _hasher.check_needs_rehash(stored_hash)
-
-
-def password_problems(password: str, email: str) -> list[str]:
-    problems = []
-    if len(password) < 10:
-        problems.append("at least 10 characters")
-    if len(password) > 256:
-        problems.append("at most 256 characters")
-    classes = sum(
-        [
-            any(c.islower() for c in password),
-            any(c.isupper() for c in password),
-            any(c.isdigit() for c in password),
-            any(not c.isalnum() for c in password),
-        ]
-    )
-    if classes < 3:
-        problems.append("at least three of: lowercase, uppercase, digits, symbols")
-    local = email.split("@")[0].lower()
-    if len(local) >= 4 and local in password.lower():
-        problems.append("must not contain your email name")
-    return problems
-
-
-def create_access_token(user_id: str, session_id: str) -> tuple[str, int]:
-    settings = get_settings()
-    now = int(time.time())
-    exp = now + settings.access_token_ttl_s
-    token = jwt.encode(
-        {
-            "sub": user_id,
-            "sid": session_id,
-            "iss": settings.jwt_issuer,
-            "aud": "sap-api",
-            "iat": now,
-            "nbf": now,
-            "exp": exp,
-            "jti": uuid.uuid4().hex,
-        },
-        get_keys().jwt_private,
-        algorithm="EdDSA",
-    )
-    return token, exp
-
-
-def decode_access_token(token: str) -> dict:
-    settings = get_settings()
-    return jwt.decode(
+def verify_access_token(token: str) -> dict:
+    """Return the verified claims, or raise ``TokenError`` / ``jwt.ExpiredSignatureError``."""
+    try:
+        header = jwt.get_unverified_header(token)
+    except jwt.PyJWTError as e:
+        raise TokenError("Malformed token") from e
+    if header.get("alg") not in ALGORITHMS:
+        raise TokenError("Unexpected signing algorithm")
+    claims = jwt.decode(
         token,
-        get_keys().jwt_public,
-        algorithms=["EdDSA"],
-        audience="sap-api",
-        issuer=settings.jwt_issuer,
-        options={"require": ["exp", "iat", "sub", "sid"]},
+        _signing_key(token),
+        algorithms=ALGORITHMS,
+        audience="authenticated",
+        issuer=get_settings().jwt_issuer,
+        options={"require": ["exp", "iat", "sub", "session_id"]},
         leeway=10,
     )
-
-
-def new_refresh_token() -> tuple[str, str]:
-    """Return (token, sha256 digest). Only the digest is stored server-side."""
-    token = secrets.token_urlsafe(48)
-    return token, hash_refresh_token(token)
-
-
-def hash_refresh_token(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
+    if claims.get("role") != "authenticated" or claims.get("is_anonymous"):
+        raise TokenError("A signed-in account is required")
+    return claims

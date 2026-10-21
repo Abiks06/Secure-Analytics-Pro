@@ -1,0 +1,14 @@
+# Never upload local secrets or build/runtime artefacts, even with a local `vercel deploy`.
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+Backend/data/
+Backend/.venv/
+**/node_modules/
+**/__pycache__/
+.pytest_cache/
+.ruff_cache/
+Frontend/dist/

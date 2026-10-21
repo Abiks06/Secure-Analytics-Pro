@@ -36,3 +36,8 @@ Backend/data/
 .ruff_cache/
 *.tsbuildinfo
 .claude/
+
+.vercel
+
+.vercel
+.env*

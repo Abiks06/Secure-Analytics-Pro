@@ -41,3 +41,6 @@ Backend/data/
 
 .vercel
 .env*
+
+# graphify knowledge graph (local)
+graphify-out/

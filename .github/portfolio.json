@@ -1,0 +1,12 @@
+{
+  "name": "Secure Analytics Pro",
+  "featured": true,
+  "startDate": "2025-10",
+  "endDate": "2025-12",
+  "highlights": [
+    "Full-stack analytics platform with a secure CSV/JSON processing engine and real-time visualization dashboard.",
+    "JWT authentication and Supabase Row Level Security for strict per-user data isolation.",
+    "Containerized monorepo with automated dependency management, scoring 100% on GitHub security audits."
+  ],
+  "keywords": ["React", "Supabase", "JWT", "RLS", "Docker"]
+}

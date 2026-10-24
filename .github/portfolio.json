@@ -4,9 +4,10 @@
   "startDate": "2025-10",
   "endDate": "2025-12",
   "highlights": [
-    "Full-stack analytics platform with a secure CSV/JSON processing engine and real-time visualization dashboard.",
-    "JWT authentication and Supabase Row Level Security for strict per-user data isolation.",
-    "Containerized monorepo with automated dependency management, scoring 100% on GitHub security audits."
+    "Full-stack analytics app: a FastAPI, Polars and DuckDB engine cleans messy CSV, JSON, Excel and Parquet files, logging every repair, then ranks insights such as drivers, anomalies, trends and forecasts.",
+    "Detects 13 kinds of personal data (Luhn-checked card numbers, IBANs, emails, phone numbers and more) and masks or redacts them by default across previews, SQL, AI answers and exports.",
+    "Supabase backend with forced Row Level Security in a private schema, a least-privilege engine role, ES256 token checks against JWKS and instant session revocation.",
+    "Per-dataset AES-256-GCM encryption with crypto-shredding, an append-only hash-chained audit log, and a DuckDB SQL sandbox with an optional Claude analyst."
   ],
-  "keywords": ["React", "Supabase", "JWT", "RLS", "Docker"]
+  "keywords": ["React", "FastAPI", "Polars", "DuckDB", "Supabase", "PostgreSQL"]
 }

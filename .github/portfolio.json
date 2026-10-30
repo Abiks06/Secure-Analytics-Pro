@@ -9,5 +9,45 @@
     "Supabase backend with forced Row Level Security in a private schema, a least-privilege engine role, ES256 token checks against JWKS and instant session revocation.",
     "Per-dataset AES-256-GCM encryption with crypto-shredding, an append-only hash-chained audit log, and a DuckDB SQL sandbox with an optional Claude analyst."
   ],
-  "keywords": ["React", "FastAPI", "Polars", "DuckDB", "Supabase", "PostgreSQL"]
+  "keywords": [
+    "React",
+    "FastAPI",
+    "Polars",
+    "DuckDB",
+    "Supabase",
+    "PostgreSQL"
+  ],
+  "tracks": [
+    "backend",
+    "fullstack"
+  ],
+  "metrics": [
+    {
+      "value": "13",
+      "label": "kinds of personal data detected and masked by default"
+    },
+    {
+      "value": "4",
+      "label": "file formats cleaned and profiled: CSV, JSON, Excel, Parquet"
+    }
+  ],
+  "pipeline": [
+    "React + Supabase Auth",
+    "FastAPI engine (verifies ES256 tokens)",
+    "Polars clean + PII scan",
+    "DuckDB SQL sandbox",
+    "Postgres with forced RLS"
+  ],
+  "decisions": [
+    {
+      "choice": "The engine connects as a least-privilege role carrying the caller's verified claims",
+      "over": "A superuser or BYPASSRLS connection",
+      "because": "A query with a forgotten filter, or one forging another owner's id, is rejected by Postgres itself."
+    },
+    {
+      "choice": "The AI analyst sees the schema and aggregates only",
+      "over": "Sending rows to the model",
+      "because": "Personal data stays inside the engine."
+    }
+  ]
 }
